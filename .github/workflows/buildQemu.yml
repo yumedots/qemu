@@ -42,6 +42,10 @@ jobs:
           brew install --formula milesbuckton/qemu-virgl/libepoxy-angle
           brew install --formula milesbuckton/qemu-virgl/virglrenderer
           echo "$(brew --prefix python)/libexec/bin" >> "$GITHUB_PATH"
+          for keg in libangle libepoxy-angle virglrenderer vde libssh ncurses; do
+            echo "${keg//-/_}=$(brew --prefix "$keg")" >> "$GITHUB_ENV"
+          done
+          echo "PKG_CONFIG_PATH=$(brew --prefix libepoxy-angle)/lib/pkgconfig:$(brew --prefix vde)/lib/pkgconfig:$(brew --prefix libssh)/lib/pkgconfig:$(brew --prefix ncurses)/lib/pkgconfig" >> "$GITHUB_ENV"
 
       - name: toolchain
         run: |
@@ -49,17 +53,13 @@ jobs:
           python3 -c 'import tomllib'
           python3 --version
           pkg-config --modversion epoxy
-          test -d "$(brew --prefix)/opt/libangle/include"
+          test -f "$vde/include/libvdeplug.h"
+          test -f "$libssh/include/libssh/libssh.h"
 
       - name: build
         run: |
           set -euo pipefail
-          home=$(brew --prefix)
-          angle=$home/opt/libangle
-          epoxy=$home/opt/libepoxy-angle
-          virgl=$home/opt/virglrenderer
           prefix=$PWD/stage/qemu/master
-          export PKG_CONFIG_PATH="$epoxy/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           ./configure \
             --prefix="$prefix" \
             --disable-bsd-user \
@@ -77,8 +77,8 @@ jobs:
             --enable-trace-backends=log,simple \
             --enable-malloc=system \
             --target-list=aarch64-softmmu \
-            --extra-cflags="-I$angle/include -I$epoxy/include -I$virgl/include -DNCURSES_WIDECHAR=1" \
-            --extra-ldflags="-L$angle/lib -L$epoxy/lib -L$virgl/lib -Wl,-rpath,$angle/lib -Wl,-rpath,$epoxy/lib -Wl,-rpath,$virgl/lib"
+            --extra-cflags="-I$libangle/include -I$libepoxy_angle/include -I$virglrenderer/include -I$vde/include -I$libssh/include -I$ncurses/include -DNCURSES_WIDECHAR=1" \
+            --extra-ldflags="-L$libangle/lib -L$libepoxy_angle/lib -L$virglrenderer/lib -L$vde/lib -L$libssh/lib -L$ncurses/lib -Wl,-rpath,$libangle/lib -Wl,-rpath,$libepoxy_angle/lib -Wl,-rpath,$virglrenderer/lib"
           make -j"$(sysctl -n hw.ncpu)"
           make install
 
