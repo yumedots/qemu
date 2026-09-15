@@ -8,6 +8,7 @@ on:
     paths:
       - .github/workflows/buildQemu.yml
       - meson.build
+      - meson_options.txt
       - ui/**
       - accel/hvf/**
       - hw/display/**
@@ -29,17 +30,26 @@ jobs:
   keg:
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: dependencies
         run: |
           brew tap milesbuckton/qemu-virgl
           brew trust milesbuckton/qemu-virgl || true
-          brew install --formula meson ninja pkg-config coreutils dtc
+          brew install --formula meson ninja pkg-config coreutils libtool dtc dbus python
           brew install --formula glib gnutls nettle jpeg libpng libslirp libssh libusb lzo ncurses pixman snappy vde
           brew install --formula milesbuckton/qemu-virgl/libangle
           brew install --formula milesbuckton/qemu-virgl/libepoxy-angle
           brew install --formula milesbuckton/qemu-virgl/virglrenderer
+          echo "$(brew --prefix python)/libexec/bin" >> "$GITHUB_PATH"
+
+      - name: toolchain
+        run: |
+          set -euo pipefail
+          python3 -c 'import tomllib'
+          python3 --version
+          pkg-config --modversion epoxy
+          test -d "$(brew --prefix)/opt/libangle/include"
 
       - name: build
         run: |
@@ -49,6 +59,7 @@ jobs:
           epoxy=$home/opt/libepoxy-angle
           virgl=$home/opt/virglrenderer
           prefix=$PWD/stage/qemu/master
+          export PKG_CONFIG_PATH="$epoxy/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           ./configure \
             --prefix="$prefix" \
             --disable-bsd-user \
@@ -71,17 +82,36 @@ jobs:
           make -j"$(sysctl -n hw.ncpu)"
           make install
 
-      - name: opengl is compiled in
+      - name: sign for hvf
         run: |
           set -euo pipefail
+          cat > hypervisor.entitlements <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.hypervisor</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+          for binary in stage/qemu/master/bin/qemu-system-*; do
+            codesign --force --sign - --entitlements hypervisor.entitlements "$binary"
+            codesign -d --entitlements - "$binary" | grep -q com.apple.security.hypervisor
+          done
+
+      - name: opengl comes up over dbus
+        run: |
+          set -euo pipefail
+          export DBUS_SESSION_BUS_ADDRESS=$(dbus-daemon --session --fork --print-address=1)
           qemu=stage/qemu/master/bin/qemu-system-aarch64
           $qemu --version
-          $qemu -nodefaults -machine none -display dbus,gl=on -S >/tmp/gl.log 2>&1 &
+          $qemu -nodefaults -machine none -display dbus,gl=on -device virtio-gpu-gl-pci -S >/tmp/gl.log 2>&1 &
           pid=$!
-          sleep 3
+          sleep 5
           if ! kill -0 "$pid" 2>/dev/null; then
             cat /tmp/gl.log
-            echo "the built qemu cannot bring up an OpenGL display" >&2
+            echo "the built qemu cannot bring up an opengl display" >&2
             exit 1
           fi
           kill "$pid"
