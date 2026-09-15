@@ -110,9 +110,10 @@ jobs:
           </dict>
           </plist>
           PLIST
+          xattr -cr stage/qemu/master
           for binary in stage/qemu/master/bin/qemu-system-*; do
             codesign --force --sign - --entitlements hypervisor.entitlements "$binary"
-            codesign -d --entitlements - "$binary" | grep -q com.apple.security.hypervisor
+            codesign -d --entitlements - "$binary" 2>&1 | grep -q com.apple.security.hypervisor
           done
 
       - name: opengl comes up over dbus
