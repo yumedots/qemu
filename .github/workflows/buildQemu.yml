@@ -42,10 +42,22 @@ jobs:
           brew install --formula milesbuckton/qemu-virgl/libepoxy-angle
           brew install --formula milesbuckton/qemu-virgl/virglrenderer
           echo "$(brew --prefix python)/libexec/bin" >> "$GITHUB_PATH"
-          for keg in libangle libepoxy-angle virglrenderer vde libssh ncurses; do
-            echo "${keg//-/_}=$(brew --prefix "$keg")" >> "$GITHUB_ENV"
+          cflags=""
+          ldflags=""
+          pkgconfig=""
+          for keg in libangle libepoxy-angle virglrenderer vde libssh ncurses snappy lzo dtc; do
+            prefix=$(brew --prefix "$keg")
+            echo "${keg//-/_}=$prefix" >> "$GITHUB_ENV"
+            cflags="$cflags -I$prefix/include"
+            ldflags="$ldflags -L$prefix/lib"
+            pkgconfig="$pkgconfig:$prefix/lib/pkgconfig"
           done
-          echo "PKG_CONFIG_PATH=$(brew --prefix libepoxy-angle)/lib/pkgconfig:$(brew --prefix vde)/lib/pkgconfig:$(brew --prefix libssh)/lib/pkgconfig:$(brew --prefix ncurses)/lib/pkgconfig" >> "$GITHUB_ENV"
+          for keg in libangle libepoxy-angle virglrenderer; do
+            ldflags="$ldflags -Wl,-rpath,$(brew --prefix "$keg")/lib"
+          done
+          echo "KEG_CFLAGS=$cflags" >> "$GITHUB_ENV"
+          echo "KEG_LDFLAGS=$ldflags" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=${pkgconfig#:}" >> "$GITHUB_ENV"
 
       - name: toolchain
         run: |
@@ -55,10 +67,13 @@ jobs:
           pkg-config --modversion epoxy
           test -f "$vde/include/libvdeplug.h"
           test -f "$libssh/include/libssh/libssh.h"
+          test -f "$snappy/include/snappy-c.h"
+          test -f "$dtc/lib/libfdt.dylib"
 
       - name: build
         run: |
           set -euo pipefail
+          home=$(brew --prefix)
           prefix=$PWD/stage/qemu/master
           ./configure \
             --prefix="$prefix" \
@@ -77,8 +92,8 @@ jobs:
             --enable-trace-backends=log,simple \
             --enable-malloc=system \
             --target-list=aarch64-softmmu \
-            --extra-cflags="-I$libangle/include -I$libepoxy_angle/include -I$virglrenderer/include -I$vde/include -I$libssh/include -I$ncurses/include -DNCURSES_WIDECHAR=1" \
-            --extra-ldflags="-L$libangle/lib -L$libepoxy_angle/lib -L$virglrenderer/lib -L$vde/lib -L$libssh/lib -L$ncurses/lib -Wl,-rpath,$libangle/lib -Wl,-rpath,$libepoxy_angle/lib -Wl,-rpath,$virglrenderer/lib"
+            --extra-cflags="-I$home/include$KEG_CFLAGS -DNCURSES_WIDECHAR=1" \
+            --extra-ldflags="-L$home/lib$KEG_LDFLAGS"
           make -j"$(sysctl -n hw.ncpu)"
           make install
 
