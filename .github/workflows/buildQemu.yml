@@ -1,0 +1,108 @@
+name: build qemu
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - .github/workflows/buildQemu.yml
+      - meson.build
+      - ui/**
+      - accel/hvf/**
+      - hw/display/**
+      - include/ui/**
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-qemu-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HOMEBREW_NO_ANALYTICS: 1
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+
+jobs:
+  keg:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: dependencies
+        run: |
+          brew tap milesbuckton/qemu-virgl
+          brew trust milesbuckton/qemu-virgl || true
+          brew install --formula meson ninja pkg-config coreutils dtc
+          brew install --formula glib gnutls nettle jpeg libpng libslirp libssh libusb lzo ncurses pixman snappy vde
+          brew install --formula milesbuckton/qemu-virgl/libangle
+          brew install --formula milesbuckton/qemu-virgl/libepoxy-angle
+          brew install --formula milesbuckton/qemu-virgl/virglrenderer
+
+      - name: build
+        run: |
+          set -euo pipefail
+          home=$(brew --prefix)
+          angle=$home/opt/libangle
+          epoxy=$home/opt/libepoxy-angle
+          virgl=$home/opt/virglrenderer
+          prefix=$PWD/stage/qemu/master
+          ./configure \
+            --prefix="$prefix" \
+            --disable-bsd-user \
+            --disable-guest-agent \
+            --disable-sdl \
+            --disable-gtk \
+            --enable-cocoa \
+            --enable-opengl \
+            --enable-virglrenderer \
+            --enable-curses \
+            --enable-libssh \
+            --enable-slirp \
+            --enable-vde \
+            --enable-fdt=system \
+            --enable-trace-backends=log,simple \
+            --enable-malloc=system \
+            --target-list=aarch64-softmmu \
+            --extra-cflags="-I$angle/include -I$epoxy/include -I$virgl/include -DNCURSES_WIDECHAR=1" \
+            --extra-ldflags="-L$angle/lib -L$epoxy/lib -L$virgl/lib -Wl,-rpath,$angle/lib -Wl,-rpath,$epoxy/lib -Wl,-rpath,$virgl/lib"
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+
+      - name: opengl is compiled in
+        run: |
+          set -euo pipefail
+          qemu=stage/qemu/master/bin/qemu-system-aarch64
+          $qemu --version
+          $qemu -nodefaults -machine none -display dbus,gl=on -S >/tmp/gl.log 2>&1 &
+          pid=$!
+          sleep 3
+          if ! kill -0 "$pid" 2>/dev/null; then
+            cat /tmp/gl.log
+            echo "the built qemu cannot bring up an OpenGL display" >&2
+            exit 1
+          fi
+          kill "$pid"
+
+      - name: package
+        run: |
+          set -euo pipefail
+          tar czf qemu-master.arm64_tahoe.tgz -C stage qemu
+          shasum -a 256 qemu-master.arm64_tahoe.tgz | tee qemu-master.arm64_tahoe.tgz.sha256
+
+      - name: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_SHA}"
+          gh release create "$tag" \
+            --title "$tag" \
+            --notes "qemu built from $tag" \
+            qemu-master.arm64_tahoe.tgz \
+            qemu-master.arm64_tahoe.tgz.sha256 \
+            || gh release upload "$tag" --clobber \
+                 qemu-master.arm64_tahoe.tgz \
+                 qemu-master.arm64_tahoe.tgz.sha256
