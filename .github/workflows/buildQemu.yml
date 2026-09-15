@@ -136,7 +136,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="${GITHUB_SHA}"
+          tag="qemu-${GITHUB_SHA}"
           gh release create "$tag" \
             --title "$tag" \
             --notes "qemu built from $tag" \
