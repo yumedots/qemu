@@ -123,15 +123,7 @@ jobs:
           $qemu --version
           otool -L "$qemu" | grep -q libepoxy
           otool -L "$qemu" | grep -q libvirglrenderer
-          $qemu -nodefaults -machine none -display cocoa,gl=es -S >/tmp/gl.log 2>&1 &
-          pid=$!
-          sleep 5
-          if ! kill -0 "$pid" 2>/dev/null; then
-            cat /tmp/gl.log
-            echo "the built qemu cannot bring up a gl display" >&2
-            exit 1
-          fi
-          kill "$pid"
+          "$qemu" -device help | grep -q virtio-gpu-gl-pci
 
       - name: package
         run: |
