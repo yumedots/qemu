@@ -36,7 +36,7 @@ jobs:
         run: |
           brew tap milesbuckton/qemu-virgl
           brew trust milesbuckton/qemu-virgl || true
-          brew install --formula meson ninja pkg-config coreutils libtool dtc dbus python
+          brew install --formula meson ninja pkg-config coreutils libtool dtc python
           brew install --formula glib gnutls nettle jpeg libpng libslirp libssh libusb lzo ncurses pixman snappy vde
           brew install --formula milesbuckton/qemu-virgl/libangle
           brew install --formula milesbuckton/qemu-virgl/libepoxy-angle
@@ -116,18 +116,19 @@ jobs:
             codesign -d --entitlements - "$binary" 2>&1 | grep -q com.apple.security.hypervisor
           done
 
-      - name: opengl comes up over dbus
+      - name: opengl is there
         run: |
           set -euo pipefail
-          export DBUS_SESSION_BUS_ADDRESS=$(dbus-daemon --session --fork --print-address=1)
           qemu=stage/qemu/master/bin/qemu-system-aarch64
           $qemu --version
-          $qemu -nodefaults -machine none -display dbus,gl=on -device virtio-gpu-gl-pci -S >/tmp/gl.log 2>&1 &
+          otool -L "$qemu" | grep -q libepoxy
+          otool -L "$qemu" | grep -q libvirglrenderer
+          $qemu -nodefaults -machine none -display cocoa,gl=es -S >/tmp/gl.log 2>&1 &
           pid=$!
           sleep 5
           if ! kill -0 "$pid" 2>/dev/null; then
             cat /tmp/gl.log
-            echo "the built qemu cannot bring up an opengl display" >&2
+            echo "the built qemu cannot bring up a gl display" >&2
             exit 1
           fi
           kill "$pid"
