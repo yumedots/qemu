@@ -652,7 +652,7 @@ static double cocoa_window_scale(uint32_t width)
         return 1.0;
     }
 
-    return backing * MAX(1.0, (double)width / (reference.width * backing));
+    return backing * ((double)width / (reference.width * backing));
 }
 
 /*
