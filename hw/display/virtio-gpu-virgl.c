@@ -654,8 +654,18 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
         return;
     }
 
+    DisplayGLTexture texture = virgl_borrow_texture_for_scanout(ss.resource_id);
+
+    if (!texture.id) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: illegal resource specified %d\n",
+                      __func__, ss.resource_id);
+        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+        return;
+    }
+
     if (!virtio_gpu_check_scanout_bounds(ss.scanout_id, ss.resource_id,
-                                         0, 0, &ss.r,
+                                         texture.width, texture.height, &ss.r,
                                          &cmd->error)) {
         return;
     }
