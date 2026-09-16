@@ -835,7 +835,8 @@ static NSRect cocoa_initial_window_frame(void)
              * the one it has, which is the mode's to within the rounding.
              */
             [[self window] setContentAspectRatio:[self frame].size];
-        } else {
+        } else if (![[self window] inLiveResize]) {
+            /* never fight the user's own drag with a mode the guest just left */
             [self resizeWindow];
         }
 
@@ -1517,10 +1518,13 @@ static NSRect cocoa_initial_window_frame(void)
 
 - (void)windowDidResize:(NSNotification *)notification
 {
+    /*
+     * Send every size of a live resize, not just the one it lands on: the
+     * guest follows the window while the user drags it, and the console
+     * keeps that from starving the guest of frames.
+     */
     [cocoaView updateScale];
-    if (![[cocoaView window] inLiveResize]) {
-        [cocoaView updateUIInfo];
-    }
+    [cocoaView updateUIInfo];
 }
 
 - (void)windowDidEndLiveResize:(NSNotification *)notification

@@ -715,12 +715,17 @@ int qemu_console_set_ui_info(QemuConsole *con, QemuUIInfo *info, bool delay)
 
     /*
      * Typically we get a flood of these as the user resizes the window.
-     * Wait until the dust has settled (one second without updates), then
-     * go notify the guest.
+     * Notifying the guest once per period of that flood lets it follow the
+     * window while it is being resized, instead of a whole second after the
+     * dust settles, which is what a settle timer would do.
      */
     con->ui_info = *info;
-    timer_mod(con->ui_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + (delay ? 1000 : 0));
+    if (!delay) {
+        timer_mod(con->ui_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME));
+    } else if (!timer_pending(con->ui_timer)) {
+        timer_mod(con->ui_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 100);
+    }
     return 0;
 }
 
