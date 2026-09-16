@@ -55,7 +55,7 @@ static void dbus_gl_surface_attach(DBusDisplayListener *ddl,
                                    uint32_t texture, bool y_0_top,
                                    int x, int y, int w, int h,
                                    int backing_width, int backing_height);
-static void dbus_gl_surface_read(DBusDisplayListener *ddl,
+static bool dbus_gl_surface_read(DBusDisplayListener *ddl,
                                  int x, int y, int w, int h);
 static void dbus_gl_surface_send(DBusDisplayListener *ddl, bool full,
                                  int x, int y, int w, int h);
@@ -115,6 +115,7 @@ struct _DBusDisplayListener {
     GLuint gl_framebuffer;
     uint8_t *gl_buffer;
     bool gl_reported;
+    EGLContext gl_context;
     bool gl_y_0_top;
     int gl_x;
     int gl_y;
@@ -787,8 +788,9 @@ static void dbus_scanout_update(DisplayChangeListener *dcl,
 #ifdef DBUS_GL_SURFACE
     DBusDisplayListener *ddl = container_of(dcl, DBusDisplayListener, dcl);
 
-    dbus_gl_surface_read(ddl, x, y, w, h);
-    dbus_gl_surface_send(ddl, false, x, y, w, h);
+    if (dbus_gl_surface_read(ddl, x, y, w, h)) {
+        dbus_gl_surface_send(ddl, false, x, y, w, h);
+    }
 #endif
     dbus_call_update_gl(dcl, x, y, w, h);
 }
@@ -808,10 +810,11 @@ static void dbus_gl_refresh(DisplayChangeListener *dcl)
             pixman_box32_t *box;
 
             box = pixman_region32_rectangles(&ddl->gl_damage, NULL) + i;
-            dbus_gl_surface_read(ddl, box->x1, box->y1,
-                                 box->x2 - box->x1, box->y2 - box->y1);
-            dbus_gl_surface_send(ddl, false, box->x1, box->y1,
-                                 box->x2 - box->x1, box->y2 - box->y1);
+            if (dbus_gl_surface_read(ddl, box->x1, box->y1,
+                                     box->x2 - box->x1, box->y2 - box->y1)) {
+                dbus_gl_surface_send(ddl, false, box->x1, box->y1,
+                                     box->x2 - box->x1, box->y2 - box->y1);
+            }
         }
         pixman_region32_clear(&ddl->gl_damage);
 #endif
@@ -991,34 +994,86 @@ static void dbus_gl_swap_red_blue(uint8_t *pixels, int width)
     }
 }
 
-static void dbus_gl_surface_read(DBusDisplayListener *ddl,
+/*
+ * Rows come back bottom up, so a texture that says its first row is the top one
+ * (VIRTIO_GPU_RESOURCE_FLAG_Y_0_TOP) is handed over the other way round, which
+ * is the turn over the software path of the same frame does not need.
+ */
+static void dbus_gl_flip_rows(uint8_t *base, int x, int y, int w, int h,
+                              size_t stride)
+{
+    uint8_t *tmp = g_malloc((size_t)w * 4);
+    int line;
+
+    for (line = 0; line < h / 2; line++) {
+        uint8_t *top = base + (size_t)(y + line) * stride + (size_t)x * 4;
+        uint8_t *bottom = base + (size_t)(y + h - 1 - line) * stride +
+                          (size_t)x * 4;
+
+        memcpy(tmp, top, (size_t)w * 4);
+        memcpy(top, bottom, (size_t)w * 4);
+        memcpy(bottom, tmp, (size_t)w * 4);
+    }
+
+    g_free(tmp);
+}
+
+static bool dbus_gl_surface_read(DBusDisplayListener *ddl,
                                  int x, int y, int w, int h)
 {
     const DBusGLESOps *gles = dbus_gles_ops();
+    EGLContext context = eglGetCurrentContext();
     size_t stride;
     uint8_t *row;
     int line;
 
     if (!ddl->gl_ds || !ddl->gl_texture || !gles->gen_framebuffers) {
-        return;
+        return false;
     }
     if (x < 0 || y < 0 || w <= 0 || h <= 0 ||
         x + w > surface_width(ddl->gl_ds) || y + h > surface_height(ddl->gl_ds)) {
-        return;
+        return false;
     }
 
-    /* the context is not current for every callback, egl-headless does the same */
-    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, qemu_egl_rn_ctx);
+    /*
+     * The texture belongs to the context the renderer draws it in, and that one
+     * is only current while the renderer leaves it so.  A context of our own
+     * cannot reach the texture and would set the owner aside, so this reads with
+     * whatever is current and says so when there is nothing to read with.
+     */
+    if (!context) {
+        if (!ddl->gl_reported) {
+            ddl->gl_reported = true;
+            error_report("dbus: no current EGL context to read the frame buffer");
+        }
+        return false;
+    }
 
+    /* a name from a context that is gone is no use, and one leak is cheaper here */
+    if (ddl->gl_context != context) {
+        ddl->gl_context = context;
+        ddl->gl_framebuffer = 0;
+    }
     if (!ddl->gl_framebuffer) {
         gles->gen_framebuffers(1, &ddl->gl_framebuffer);
     }
     gles->bind_framebuffer(GL_FRAMEBUFFER, ddl->gl_framebuffer);
     gles->framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                  GL_TEXTURE_2D, ddl->gl_texture, 0);
-    if (gles->check_framebuffer_status &&
-        gles->check_framebuffer_status(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        return;
+    if (gles->check_framebuffer_status) {
+        GLenum status = gles->check_framebuffer_status(GL_FRAMEBUFFER);
+
+        if (status != GL_FRAMEBUFFER_COMPLETE) {
+            if (!ddl->gl_reported) {
+                ddl->gl_reported = true;
+                error_report("dbus: frame buffer is not complete (0x%x)", status);
+            }
+            return false;
+        }
+    }
+
+    /* a sticky error from an earlier call would be read as this one's */
+    while (gles->get_error && gles->get_error() != GL_NO_ERROR) {
     }
 
     /*
@@ -1038,22 +1093,34 @@ static void dbus_gl_surface_read(DBusDisplayListener *ddl,
         for (line = 0; line < h; line++) {
             dbus_gl_swap_red_blue(row + (size_t)line * stride, w);
         }
+        if (ddl->gl_y_0_top) {
+            dbus_gl_flip_rows(surface_data(ddl->gl_ds), x, y, w, h, stride);
+        }
     } else {
         ddl->gl_buffer = g_realloc(ddl->gl_buffer, (size_t)w * h * 4);
         gles->read_pixels(ddl->gl_x + x, ddl->gl_y + y, w, h,
                           GL_RGBA, GL_UNSIGNED_BYTE, ddl->gl_buffer);
         for (line = 0; line < h; line++) {
             dbus_gl_swap_red_blue(ddl->gl_buffer + (size_t)line * w * 4, w);
+        }
+        if (ddl->gl_y_0_top) {
+            dbus_gl_flip_rows(ddl->gl_buffer, 0, 0, w, h, (size_t)w * 4);
+        }
+        for (line = 0; line < h; line++) {
             memcpy(row + (size_t)line * stride,
                    ddl->gl_buffer + (size_t)line * w * 4, (size_t)w * 4);
         }
     }
-    glFinish();
+    if (gles->get_error && !ddl->gl_reported) {
+        GLenum error = gles->get_error();
 
-    if (gles->get_error && gles->get_error() != GL_NO_ERROR && !ddl->gl_reported) {
-        ddl->gl_reported = true;
-        error_report("dbus: frame buffer read back failed");
+        if (error != GL_NO_ERROR) {
+            ddl->gl_reported = true;
+            error_report("dbus: frame buffer read back failed (0x%x)", error);
+        }
     }
+
+    return true;
 }
 
 static void dbus_gl_surface_attach(DBusDisplayListener *ddl,
@@ -1082,8 +1149,10 @@ static void dbus_gl_surface_attach(DBusDisplayListener *ddl,
     ddl->gl_width = backing_width;
     ddl->gl_height = backing_height;
 
-    dbus_gl_surface_read(ddl, 0, 0, w, h);
-    dbus_gl_surface_send(ddl, true, 0, 0, w, h);
+    /* what could not be read is not sent: a blank surface is not the guest's */
+    if (dbus_gl_surface_read(ddl, 0, 0, w, h)) {
+        dbus_gl_surface_send(ddl, true, 0, 0, w, h);
+    }
 }
 #endif
 
