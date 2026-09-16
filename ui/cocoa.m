@@ -610,6 +610,8 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
 - (void) resizeWindow
 {
+    [[self window] setContentAspectRatio:NSMakeSize(screen.width, screen.height)];
+
     if (!([[self window] styleMask] & NSWindowStyleMaskResizable)) {
         CGFloat width = screen.width / [[self window] backingScaleFactor];
         CGFloat height = screen.height / [[self window] backingScaleFactor];
@@ -619,6 +621,8 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     } else if ([[self window] styleMask] & NSWindowStyleMaskFullScreen) {
         [[self window] setContentSize:[self fixAspectRatio:[self screenSafeAreaSize]]];
         [[self window] center];
+    } else {
+        [[self window] setContentSize:[self fixAspectRatio:[self frame].size]];
     }
 }
 
