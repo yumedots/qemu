@@ -306,6 +306,13 @@ static void handleAnyDeviceErrors(Error * err)
 
 QemuCocoaView *cocoaView;
 
+/*
+ * The mode we last asked the guest for, so a mode change that is only that
+ * request coming back is recognisable.
+ */
+static uint32_t asked_mode_width;
+static uint32_t asked_mode_height;
+
 static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEventRef cgEvent, void *userInfo)
 {
     QemuCocoaView *view = userInfo;
@@ -775,6 +782,8 @@ static NSRect cocoa_initial_window_frame(void)
 
     sent = info;
     hasSent = true;
+    asked_mode_width = info.width;
+    asked_mode_height = info.height;
 
     qemu_console_set_ui_info(dcl.con, &info, TRUE);
 }
@@ -808,6 +817,24 @@ static NSRect cocoa_initial_window_frame(void)
         COCOA_DEBUG("updateScreenWidth:height: new size %d x %d\n", w, h);
         screen.width = w;
         screen.height = h;
+
+        /*
+         * The mode is the window in pixels rounded to whole logical pixels, so
+         * the window and the mode we asked for differ by up to half of that
+         * rounding.  Conforming the window to the mode then asks for the next
+         * mode, and the window walks itself down until the rounding stops
+         * changing.  Landing on the size that asks for exactly this mode ends
+         * that in one step, provided the guest is following us rather than
+         * choosing a mode of its own.
+         */
+        if ((uint32_t)w == asked_mode_width && (uint32_t)h == asked_mode_height &&
+            ![[self window] inLiveResize]) {
+            CGFloat backing = [[self window] backingScaleFactor];
+            if (backing > 0) {
+                [[self window] setContentSize:NSMakeSize(w / backing, h / backing)];
+            }
+        }
+
         [self resizeWindow];
         [self updateScale];
     }
