@@ -63,6 +63,10 @@ EGLSurface qemu_egl_init_surface(EGLContext ectx, EGLNativeWindowType win);
 
 int qemu_egl_init_dpy_cocoa(DisplayGLMode mode);
 
+#ifdef __APPLE__
+int qemu_egl_init_dpy_angle(DisplayGLMode mode);
+#endif
+
 #if defined(CONFIG_X11) || defined(CONFIG_GBM) || defined(WIN32)
 EGLDisplay qemu_egl_get_display(EGLNativeDisplayType native,
                                 EGLenum platform);

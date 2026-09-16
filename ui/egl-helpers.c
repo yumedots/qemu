@@ -30,6 +30,12 @@ EGLConfig qemu_egl_config;
 DisplayGLMode qemu_egl_mode;
 bool qemu_egl_angle_d3d;
 
+#ifndef EGL_PLATFORM_ANGLE_ANGLE
+#define EGL_PLATFORM_ANGLE_ANGLE 0x3202
+#define EGL_PLATFORM_ANGLE_TYPE_ANGLE 0x3203
+#define EGL_PLATFORM_ANGLE_TYPE_OPENGL_ANGLE 0x320D
+#endif
+
 /* ------------------------------------------------------------------ */
 
 const char *qemu_egl_get_error_string(void)
@@ -511,9 +517,47 @@ EGLDisplay qemu_egl_get_display(EGLNativeDisplayType native,
     return dpy;
 }
 
+static int qemu_egl_configure_display(DisplayGLMode mode);
+
+static int qemu_egl_setup_display(EGLDisplay dpy, DisplayGLMode mode)
+{
+    if (dpy == EGL_NO_DISPLAY) {
+        error_report("egl: eglGetDisplay failed: %s", qemu_egl_get_error_string());
+        return -1;
+    }
+
+    qemu_egl_display = dpy;
+    return qemu_egl_configure_display(mode);
+}
+
 static int qemu_egl_init_dpy(EGLNativeDisplayType dpy,
                              EGLenum platform,
                              DisplayGLMode mode)
+{
+    return qemu_egl_setup_display(qemu_egl_get_display(dpy, platform), mode);
+}
+
+#ifdef __APPLE__
+/*
+ * Ask ANGLE for its OpenGL backend instead of the Metal one it picks by default.
+ * Without a window the Metal backend leaves the platform's GL entry points --- the
+ * ones libepoxy hands out on macOS --- without a context of their own, and the
+ * first call into them dies.
+ */
+int qemu_egl_init_dpy_angle(DisplayGLMode mode)
+{
+    static const EGLint att[] = {
+        EGL_PLATFORM_ANGLE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_TYPE_OPENGL_ANGLE,
+        EGL_NONE,
+    };
+
+    return qemu_egl_setup_display(
+        eglGetPlatformDisplayEXT(EGL_PLATFORM_ANGLE_ANGLE, EGL_DEFAULT_DISPLAY,
+                                 att), mode);
+}
+#endif
+
+static int qemu_egl_configure_display(DisplayGLMode mode)
 {
     static const EGLint conf_att_core[] = {
         EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
@@ -537,12 +581,6 @@ static int qemu_egl_init_dpy(EGLNativeDisplayType dpy,
     EGLBoolean b;
     EGLint n;
     bool gles = (mode == DISPLAY_GL_MODE_ES);
-
-    qemu_egl_display = qemu_egl_get_display(dpy, platform);
-    if (qemu_egl_display == EGL_NO_DISPLAY) {
-        error_report("egl: eglGetDisplay failed: %s", qemu_egl_get_error_string());
-        return -1;
-    }
 
     b = eglInitialize(qemu_egl_display, &major, &minor);
     if (b == EGL_FALSE) {
@@ -696,6 +734,20 @@ bool egl_init(const char *rendernode, DisplayGLMode mode, Error **errp)
 #elif defined(CONFIG_GBM)
     if (egl_rendernode_init(rendernode, mode) < 0) {
         error_setg(errp, "egl: render node init failed");
+        return false;
+    }
+#elif defined(__APPLE__)
+    /* ANGLE has no core profile config on Apple, GL ES is what it renders */
+    if (mode == DISPLAY_GL_MODE_ON) {
+        mode = DISPLAY_GL_MODE_ES;
+    }
+    if (qemu_egl_init_dpy_angle(mode) < 0 && qemu_egl_init_dpy_cocoa(mode) < 0) {
+        error_setg(errp, "egl: init failed");
+        return false;
+    }
+    qemu_egl_rn_ctx = qemu_egl_init_ctx();
+    if (!qemu_egl_rn_ctx) {
+        error_setg(errp, "egl: egl_init_ctx failed");
         return false;
     }
 #endif

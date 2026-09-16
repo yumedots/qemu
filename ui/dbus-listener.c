@@ -43,8 +43,23 @@
 #endif
 #include "trace.h"
 
+#if defined(__APPLE__) && defined(CONFIG_OPENGL)
+#define DBUS_GL_SURFACE 1
+#endif
+
 static void dbus_gfx_switch(DisplayChangeListener *dcl,
                             struct DisplaySurface *new_surface);
+
+#ifdef DBUS_GL_SURFACE
+static void dbus_gl_surface_attach(DBusDisplayListener *ddl,
+                                   uint32_t texture, bool y_0_top,
+                                   int x, int y, int w, int h,
+                                   int backing_width, int backing_height);
+static void dbus_gl_surface_read(DBusDisplayListener *ddl,
+                                 int x, int y, int w, int h);
+static void dbus_gl_surface_send(DBusDisplayListener *ddl, bool full,
+                                 int x, int y, int w, int h);
+#endif
 
 enum share_kind {
     SHARE_KIND_NONE,
@@ -93,6 +108,19 @@ struct _DBusDisplayListener {
     guint32 cursor_serial_to_discard;
 
     QemuDmaBuf *scanout_dmabuf;
+
+#ifdef DBUS_GL_SURFACE
+    DisplaySurface *gl_ds;
+    uint32_t gl_texture;
+    GLuint gl_framebuffer;
+    uint8_t *gl_buffer;
+    bool gl_reported;
+    bool gl_y_0_top;
+    int gl_x;
+    int gl_y;
+    int gl_width;
+    int gl_height;
+#endif
 };
 
 G_DEFINE_TYPE(DBusDisplayListener, dbus_display_listener, G_TYPE_OBJECT)
@@ -121,6 +149,11 @@ static void dbus_scanout_disable(DisplayChangeListener *dcl)
 {
     DBusDisplayListener *ddl = container_of(dcl, DBusDisplayListener, dcl);
 
+#ifdef DBUS_GL_SURFACE
+    ddl->gl_texture = 0;
+    g_clear_pointer(&ddl->gl_ds, qemu_free_displaysurface);
+    g_clear_pointer(&ddl->gl_buffer, g_free);
+#endif
     ddl->scanout_dmabuf = NULL;
     ddl_discard_display_messages(ddl);
 
@@ -633,6 +666,13 @@ static void dbus_scanout_borrowed_texture(DisplayChangeListener *dcl,
     }
 #endif
 
+#ifdef DBUS_GL_SURFACE
+    DBusDisplayListener *ddl = container_of(dcl, DBusDisplayListener, dcl);
+
+    dbus_gl_surface_attach(ddl, tex_id, backing_y_0_top, x, y, w, h,
+                           backing_width, backing_height);
+#endif
+
 #ifdef WIN32
     /* there must be a matching gfx_switch before */
     assert(surface_width(ddl->ds) == w);
@@ -744,6 +784,12 @@ static void dbus_scanout_update(DisplayChangeListener *dcl,
                                 uint32_t x, uint32_t y,
                                 uint32_t w, uint32_t h)
 {
+#ifdef DBUS_GL_SURFACE
+    DBusDisplayListener *ddl = container_of(dcl, DBusDisplayListener, dcl);
+
+    dbus_gl_surface_read(ddl, x, y, w, h);
+    dbus_gl_surface_send(ddl, false, x, y, w, h);
+#endif
     dbus_call_update_gl(dcl, x, y, w, h);
 }
 
@@ -752,6 +798,25 @@ static void dbus_gl_refresh(DisplayChangeListener *dcl)
     DBusDisplayListener *ddl = container_of(dcl, DBusDisplayListener, dcl);
 
     qemu_console_hw_update(dcl->con);
+
+#ifdef DBUS_GL_SURFACE
+    if (ddl->gl_ds) {
+#ifdef CONFIG_PIXMAN
+        int n_rects = pixman_region32_n_rects(&ddl->gl_damage);
+
+        for (int i = 0; i < n_rects; i++) {
+            pixman_box32_t *box;
+
+            box = pixman_region32_rectangles(&ddl->gl_damage, NULL) + i;
+            dbus_gl_surface_read(ddl, box->x1, box->y1,
+                                 box->x2 - box->x1, box->y2 - box->y1);
+            dbus_gl_surface_send(ddl, false, box->x1, box->y1,
+                                 box->x2 - box->x1, box->y2 - box->y1);
+        }
+        pixman_region32_clear(&ddl->gl_damage);
+#endif
+    }
+#endif
 
     if (!ddl->ds || qemu_console_is_gl_blocked(ddl->dcl.con)) {
         return;
@@ -858,6 +923,149 @@ static void ddl_scanout(DBusDisplayListener *ddl)
         surface_stride(ddl->ds), surface_format(ddl->ds), v_data,
         G_DBUS_CALL_FLAGS_NONE, DBUS_DEFAULT_TIMEOUT, NULL, NULL, NULL);
 }
+
+#ifdef DBUS_GL_SURFACE
+static void dbus_gl_surface_send(DBusDisplayListener *ddl, bool full,
+                                 int x, int y, int w, int h)
+{
+    DisplaySurface *saved = ddl->ds;
+
+    ddl->ds = ddl->gl_ds;
+    if (full) {
+        ddl_scanout(ddl);
+    } else {
+        dbus_gfx_update_sub(ddl, x, y, w, h);
+    }
+    ddl->ds = saved;
+}
+
+/*
+ * The GL ES entry points come from the EGL display that owns the context and not
+ * from the libepoxy wrappers: on macOS libepoxy hands out the frame buffer
+ * functions of the system OpenGL library, which has no context in this process,
+ * and the first call dies there.  ANGLE owns this EGL display and its context.
+ */
+typedef struct DBusGLESOps {
+    void (*gen_framebuffers)(GLsizei, GLuint *);
+    void (*bind_framebuffer)(GLenum, GLuint);
+    void (*framebuffer_texture_2d)(GLenum, GLenum, GLenum, GLuint, GLint);
+    GLenum (*check_framebuffer_status)(GLenum);
+    GLenum (*get_error)(void);
+    void (*read_pixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *);
+} DBusGLESOps;
+
+static const DBusGLESOps *dbus_gles_ops(void)
+{
+    static DBusGLESOps ops;
+    static bool resolved;
+
+    if (!resolved) {
+        resolved = true;
+        ops.gen_framebuffers = (void *)eglGetProcAddress("glGenFramebuffers");
+        ops.bind_framebuffer = (void *)eglGetProcAddress("glBindFramebuffer");
+        ops.framebuffer_texture_2d =
+            (void *)eglGetProcAddress("glFramebufferTexture2D");
+        ops.check_framebuffer_status =
+            (void *)eglGetProcAddress("glCheckFramebufferStatus");
+        ops.get_error = (void *)eglGetProcAddress("glGetError");
+        ops.read_pixels = (void *)eglGetProcAddress("glReadPixels");
+        if (!ops.gen_framebuffers || !ops.bind_framebuffer ||
+            !ops.framebuffer_texture_2d || !ops.read_pixels) {
+            error_report("dbus: EGL has no frame buffer entry points");
+            ops.gen_framebuffers = NULL;
+        }
+    }
+
+    return &ops;
+}
+
+static void dbus_gl_surface_read(DBusDisplayListener *ddl,
+                                 int x, int y, int w, int h)
+{
+    const DBusGLESOps *gles = dbus_gles_ops();
+    size_t stride;
+    uint8_t *row;
+    int line;
+
+    if (!ddl->gl_ds || !ddl->gl_texture || !gles->gen_framebuffers) {
+        return;
+    }
+    if (x < 0 || y < 0 || w <= 0 || h <= 0 ||
+        x + w > surface_width(ddl->gl_ds) || y + h > surface_height(ddl->gl_ds)) {
+        return;
+    }
+
+    /* the context is not current for every callback, egl-headless does the same */
+    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, qemu_egl_rn_ctx);
+
+    if (!ddl->gl_framebuffer) {
+        gles->gen_framebuffers(1, &ddl->gl_framebuffer);
+    }
+    gles->bind_framebuffer(GL_FRAMEBUFFER, ddl->gl_framebuffer);
+    gles->framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                 GL_TEXTURE_2D, ddl->gl_texture, 0);
+    if (gles->check_framebuffer_status &&
+        gles->check_framebuffer_status(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        return;
+    }
+
+    /*
+     * The damage rect of the borrowed texture lands in the same place of the
+     * software surface, which is the one the client is sent.  GL ES has no row
+     * length, so a partial read goes through a packed buffer first.
+     */
+    stride = surface_stride(ddl->gl_ds);
+    row = surface_data(ddl->gl_ds) + (size_t)y * stride + (size_t)x * 4;
+    if (x == 0 && w == surface_width(ddl->gl_ds)) {
+        gles->read_pixels(ddl->gl_x, ddl->gl_y + y, w, h,
+                          GL_BGRA, GL_UNSIGNED_BYTE, row);
+    } else {
+        ddl->gl_buffer = g_realloc(ddl->gl_buffer, (size_t)w * h * 4);
+        gles->read_pixels(ddl->gl_x + x, ddl->gl_y + y, w, h,
+                          GL_BGRA, GL_UNSIGNED_BYTE, ddl->gl_buffer);
+        for (line = 0; line < h; line++) {
+            memcpy(row + (size_t)line * stride,
+                   ddl->gl_buffer + (size_t)line * w * 4, (size_t)w * 4);
+        }
+    }
+    glFinish();
+
+    if (gles->get_error && gles->get_error() != GL_NO_ERROR && !ddl->gl_reported) {
+        ddl->gl_reported = true;
+        error_report("dbus: frame buffer read back failed");
+    }
+}
+
+static void dbus_gl_surface_attach(DBusDisplayListener *ddl,
+                                   uint32_t texture, bool y_0_top,
+                                   int x, int y, int w, int h,
+                                   int backing_width, int backing_height)
+{
+    if (!w || !h || !backing_width || !backing_height) {
+        return;
+    }
+
+    if (!ddl->gl_ds || surface_width(ddl->gl_ds) != w ||
+        surface_height(ddl->gl_ds) != h) {
+        qemu_free_displaysurface(ddl->gl_ds);
+        ddl->gl_ds = qemu_create_displaysurface(w, h);
+    }
+    if (ddl->gl_buffer) {
+        g_free(ddl->gl_buffer);
+        ddl->gl_buffer = NULL;
+    }
+
+    ddl->gl_texture = texture;
+    ddl->gl_y_0_top = y_0_top;
+    ddl->gl_x = x;
+    ddl->gl_y = y;
+    ddl->gl_width = backing_width;
+    ddl->gl_height = backing_height;
+
+    dbus_gl_surface_read(ddl, 0, 0, w, h);
+    dbus_gl_surface_send(ddl, true, 0, 0, w, h);
+}
+#endif
 
 static void dbus_gfx_update(DisplayChangeListener *dcl,
                             int x, int y, int w, int h)
