@@ -979,6 +979,18 @@ static const DBusGLESOps *dbus_gles_ops(void)
     return &ops;
 }
 
+static void dbus_gl_swap_red_blue(uint8_t *pixels, int width)
+{
+    int i;
+
+    for (i = 0; i < width; i++) {
+        uint8_t red = pixels[i * 4];
+
+        pixels[i * 4] = pixels[i * 4 + 2];
+        pixels[i * 4 + 2] = red;
+    }
+}
+
 static void dbus_gl_surface_read(DBusDisplayListener *ddl,
                                  int x, int y, int w, int h)
 {
@@ -1014,16 +1026,24 @@ static void dbus_gl_surface_read(DBusDisplayListener *ddl,
      * software surface, which is the one the client is sent.  GL ES has no row
      * length, so a partial read goes through a packed buffer first.
      */
+    /*
+     * GL ES has no GL_BGRA to read into, and the software surface is BGRA, so the
+     * channels come back swapped and are put back in place.
+     */
     stride = surface_stride(ddl->gl_ds);
     row = surface_data(ddl->gl_ds) + (size_t)y * stride + (size_t)x * 4;
     if (x == 0 && w == surface_width(ddl->gl_ds)) {
         gles->read_pixels(ddl->gl_x, ddl->gl_y + y, w, h,
-                          GL_BGRA, GL_UNSIGNED_BYTE, row);
+                          GL_RGBA, GL_UNSIGNED_BYTE, row);
+        for (line = 0; line < h; line++) {
+            dbus_gl_swap_red_blue(row + (size_t)line * stride, w);
+        }
     } else {
         ddl->gl_buffer = g_realloc(ddl->gl_buffer, (size_t)w * h * 4);
         gles->read_pixels(ddl->gl_x + x, ddl->gl_y + y, w, h,
-                          GL_BGRA, GL_UNSIGNED_BYTE, ddl->gl_buffer);
+                          GL_RGBA, GL_UNSIGNED_BYTE, ddl->gl_buffer);
         for (line = 0; line < h; line++) {
+            dbus_gl_swap_red_blue(ddl->gl_buffer + (size_t)line * w * 4, w);
             memcpy(row + (size_t)line * stride,
                    ddl->gl_buffer + (size_t)line * w * 4, (size_t)w * 4);
         }
