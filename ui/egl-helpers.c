@@ -537,26 +537,6 @@ static int qemu_egl_init_dpy(EGLNativeDisplayType dpy,
     return qemu_egl_setup_display(qemu_egl_get_display(dpy, platform), mode);
 }
 
-#ifdef __APPLE__
-/*
- * Ask ANGLE for its OpenGL backend instead of the Metal one it picks by default.
- * Without a window the Metal backend leaves the platform's GL entry points --- the
- * ones libepoxy hands out on macOS --- without a context of their own, and the
- * first call into them dies.
- */
-int qemu_egl_init_dpy_angle(DisplayGLMode mode)
-{
-    static const EGLint att[] = {
-        EGL_PLATFORM_ANGLE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_TYPE_OPENGL_ANGLE,
-        EGL_NONE,
-    };
-
-    return qemu_egl_setup_display(
-        eglGetPlatformDisplayEXT(EGL_PLATFORM_ANGLE_ANGLE, EGL_DEFAULT_DISPLAY,
-                                 att), mode);
-}
-#endif
-
 static int qemu_egl_configure_display(DisplayGLMode mode)
 {
     static const EGLint conf_att_core[] = {
@@ -741,7 +721,7 @@ bool egl_init(const char *rendernode, DisplayGLMode mode, Error **errp)
     if (mode == DISPLAY_GL_MODE_ON) {
         mode = DISPLAY_GL_MODE_ES;
     }
-    if (qemu_egl_init_dpy_angle(mode) < 0 && qemu_egl_init_dpy_cocoa(mode) < 0) {
+    if (qemu_egl_init_dpy_cocoa(mode) < 0) {
         error_setg(errp, "egl: init failed");
         return false;
     }
@@ -750,6 +730,7 @@ bool egl_init(const char *rendernode, DisplayGLMode mode, Error **errp)
         error_setg(errp, "egl: egl_init_ctx failed");
         return false;
     }
+    qemu_egl_angle_dispatch();
 #endif
 
     if (!qemu_egl_rn_ctx) {
@@ -782,3 +763,78 @@ void egl_cleanup(void)
     g_clear_fd(&qemu_egl_rn_fd, NULL);
 #endif
 }
+
+#ifdef __APPLE__
+/*
+ * libepoxy resolves GL through the platform's own GL library, which on macOS is not
+ * the one that owns the context: ANGLE's.  Calls would then run against a library with
+ * no current context of its own.  Take the entry points the display path uses from the
+ * EGL display instead, so they and the context belong to the same implementation.
+ */
+#define QEMU_ANGLE_GL(name)                                                  \
+    do {                                                                     \
+        void *proc = (void *)eglGetProcAddress(#name);                        \
+        if (proc) {                                                           \
+            epoxy_##name = (__typeof__(epoxy_##name))proc;                    \
+        }                                                                     \
+    } while (0)
+
+void qemu_egl_angle_dispatch(void)
+{
+    QEMU_ANGLE_GL(glAttachShader);
+    QEMU_ANGLE_GL(glBindBuffer);
+    QEMU_ANGLE_GL(glBindFramebuffer);
+    QEMU_ANGLE_GL(glBindTexture);
+    QEMU_ANGLE_GL(glBindVertexArray);
+    QEMU_ANGLE_GL(glBlendFunc);
+    QEMU_ANGLE_GL(glBlitFramebuffer);
+    QEMU_ANGLE_GL(glBufferData);
+    QEMU_ANGLE_GL(glCheckFramebufferStatus);
+    QEMU_ANGLE_GL(glClear);
+    QEMU_ANGLE_GL(glClearColor);
+    QEMU_ANGLE_GL(glCompileShader);
+    QEMU_ANGLE_GL(glCreateProgram);
+    QEMU_ANGLE_GL(glCreateShader);
+    QEMU_ANGLE_GL(glDeleteFramebuffers);
+    QEMU_ANGLE_GL(glDeleteProgram);
+    QEMU_ANGLE_GL(glDeleteShader);
+    QEMU_ANGLE_GL(glDeleteTextures);
+    QEMU_ANGLE_GL(glDisable);
+    QEMU_ANGLE_GL(glDrawArrays);
+    QEMU_ANGLE_GL(glEGLImageTargetTexture2DOES);
+    QEMU_ANGLE_GL(glEnable);
+    QEMU_ANGLE_GL(glEnableVertexAttribArray);
+    QEMU_ANGLE_GL(glFinish);
+    QEMU_ANGLE_GL(glFlush);
+    QEMU_ANGLE_GL(glFramebufferTexture2D);
+    QEMU_ANGLE_GL(glFramebufferTexture2DEXT);
+    QEMU_ANGLE_GL(glGenBuffers);
+    QEMU_ANGLE_GL(glGenFramebuffers);
+    QEMU_ANGLE_GL(glGenTextures);
+    QEMU_ANGLE_GL(glGenVertexArrays);
+    QEMU_ANGLE_GL(glGetAttribLocation);
+    QEMU_ANGLE_GL(glGetBooleanv);
+    QEMU_ANGLE_GL(glGetError);
+    QEMU_ANGLE_GL(glGetFloatv);
+    QEMU_ANGLE_GL(glGetIntegerv);
+    QEMU_ANGLE_GL(glGetString);
+    QEMU_ANGLE_GL(glGetStringi);
+    QEMU_ANGLE_GL(glGetTexLevelParameteriv);
+    QEMU_ANGLE_GL(glGetProgramInfoLog);
+    QEMU_ANGLE_GL(glGetProgramiv);
+    QEMU_ANGLE_GL(glGetShaderInfoLog);
+    QEMU_ANGLE_GL(glGetShaderiv);
+    QEMU_ANGLE_GL(glLinkProgram);
+    QEMU_ANGLE_GL(glMapBufferRange);
+    QEMU_ANGLE_GL(glPixelStorei);
+    QEMU_ANGLE_GL(glReadBuffer);
+    QEMU_ANGLE_GL(glReadPixels);
+    QEMU_ANGLE_GL(glShaderSource);
+    QEMU_ANGLE_GL(glTexImage2D);
+    QEMU_ANGLE_GL(glTexParameteri);
+    QEMU_ANGLE_GL(glTexSubImage2D);
+    QEMU_ANGLE_GL(glUseProgram);
+    QEMU_ANGLE_GL(glVertexAttribPointer);
+    QEMU_ANGLE_GL(glViewport);
+}
+#endif

@@ -91,4 +91,8 @@ void egl_cleanup(void);
 
 const char *qemu_egl_get_error_string(void);
 
+#ifdef __APPLE__
+void qemu_egl_angle_dispatch(void);
+#endif
+
 #endif /* EGL_HELPERS_H */
