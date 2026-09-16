@@ -634,15 +634,25 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 }
 
 /*
- * The guest's logical size is the backing size divided by the scale of the
- * screen the window is on, so the pixels asked for are rounded down to a
- * multiple of it and the guest's own dimensions come out whole.
+ * The guest's logical size is the mode divided by its scale, so the mode is
+ * rounded to a multiple of 48, which is what whole logical pixels at a
+ * fractional scale cost.
  */
-static uint32_t cocoa_clean_extent(CGFloat extent, CGFloat scale)
+static uint32_t cocoa_clean_extent(CGFloat extent)
 {
-    uint32_t divisor = scale > 1.75 ? 2 : scale > 1.25 ? 3 : 1;
+    return MAX(48u, (uint32_t)lround(extent / 48.0) * 48u);
+}
 
-    return MAX(divisor, (uint32_t)extent / divisor * divisor);
+static double cocoa_window_scale(uint32_t width)
+{
+    NSSize reference = cocoa_initial_window_frame().size;
+    CGFloat backing = [[cocoaView window] backingScaleFactor];
+
+    if (reference.width <= 0 || backing <= 0) {
+        return 1.0;
+    }
+
+    return backing * MAX(1.0, (double)width / (reference.width * backing));
 }
 
 /*
@@ -731,27 +741,24 @@ static NSRect cocoa_initial_window_frame(void)
             qemu_console_listener_set_refresh(&dcl, MAX(1u, 1000000u / refreshRate));
             info.refresh_rate = refreshRate;
         }
-
-        /*
-         * The window's size in points at 110 logical DPI: a guest that reads the
-         * density back lands on scale 1 for a 1x screen and 2 for a 2x one, and a
-         * 1.5x screen lands between them.  Whole centimetres, which is what the
-         * base EDID block can store.
-         */
-        info.width_mm = 10 * MIN(255, MAX(1, (int)lround(frameSize.width * 2.54 / 110.0)));
-        info.height_mm = 10 * MIN(255, MAX(1, (int)lround(frameSize.height * 2.54 / 110.0)));
     } else {
         frameSize = [self frame].size;
-        info.width_mm = 0;
-        info.height_mm = 0;
     }
+
+    info.width_mm = 0;
+    info.height_mm = 0;
 
     info.xoff = 0;
     info.yoff = 0;
-    info.width = cocoa_clean_extent([self convertSizeToBacking:frameSize].width,
-                                    [[self window] backingScaleFactor]);
-    info.height = cocoa_clean_extent([self convertSizeToBacking:frameSize].height,
-                                     [[self window] backingScaleFactor]);
+    info.width = cocoa_clean_extent([self convertSizeToBacking:frameSize].width);
+    info.height = cocoa_clean_extent([self convertSizeToBacking:frameSize].height);
+
+    if ([self window]) {
+        double scale = cocoa_window_scale(info.width);
+
+        info.width_mm = (int)lround(25.4 * info.width / (110.0 * scale));
+        info.height_mm = (int)lround(25.4 * info.height / (110.0 * scale));
+    }
 
     /*
      * A guest that adopts the mode makes the window fit that mode, which lands
@@ -1412,6 +1419,10 @@ static NSRect cocoa_initial_window_frame(void)
 {
     COCOA_DEBUG("QemuCocoaAppController: applicationDidFinishLaunching\n");
     allow_events = true;
+
+    [[cocoaView window] setContentSize:cocoa_initial_window_frame().size];
+    [[cocoaView window] center];
+    [cocoaView updateUIInfo];
 }
 
 - (void)applicationWillTerminate:(NSNotification *)aNotification
