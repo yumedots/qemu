@@ -827,15 +827,18 @@ static NSRect cocoa_initial_window_frame(void)
          * that in one step, provided the guest is following us rather than
          * choosing a mode of its own.
          */
-        if ((uint32_t)w == asked_mode_width && (uint32_t)h == asked_mode_height &&
-            ![[self window] inLiveResize]) {
-            CGFloat backing = [[self window] backingScaleFactor];
-            if (backing > 0) {
-                [[self window] setContentSize:NSMakeSize(w / backing, h / backing)];
-            }
+        if ((uint32_t)w == asked_mode_width && (uint32_t)h == asked_mode_height) {
+            /*
+             * The guest is following the window, so the window is already the
+             * size that asks for this mode: conforming it would be the resize
+             * the user sees and did not ask for.  The aspect it is held to is
+             * the one it has, which is the mode's to within the rounding.
+             */
+            [[self window] setContentAspectRatio:[self frame].size];
+        } else {
+            [self resizeWindow];
         }
 
-        [self resizeWindow];
         [self updateScale];
     }
 }
@@ -2321,6 +2324,35 @@ static void cocoa_gl_switch(DisplayChangeListener *dcl,
     gl_dirty = true;
 }
 
+/*
+ * The guest's frame is scaled to fill the window without changing shape: the
+ * guest's aspect is what gets drawn, so a window that no longer matches it
+ * loses a sliver of the picture instead of squeezing all of it, and a window
+ * that does match shows every pixel.
+ */
+static void cocoa_gl_viewport(NSSize size, int scanout_width, int scanout_height)
+{
+    NSSize fit = size;
+    double aspect;
+
+    if (scanout_width <= 0 || scanout_height <= 0 || size.height <= 0) {
+        glViewport(0, 0, size.width, size.height);
+        return;
+    }
+
+    aspect = (double)scanout_width / scanout_height;
+
+    /* overflow the short side rather than leave it unpainted; gl clips it */
+    if (size.width / size.height > aspect) {
+        fit.height = size.width / aspect;
+    } else {
+        fit.width = size.height * aspect;
+    }
+
+    glViewport(lround((size.width - fit.width) / 2.0), lround((size.height - fit.height) / 2.0),
+               lround(fit.width), lround(fit.height));
+}
+
 static void cocoa_gl_render(void)
 {
     NSSize frameSize = [cocoaView frame].size;
@@ -2341,16 +2373,16 @@ static void cocoa_gl_render(void)
 
     GLint filter = qatomic_read(&zoom_interpolation) ? GL_LINEAR : GL_NEAREST;
 
-    glViewport(0, 0, size.width, size.height);
-
     if (gl_scanout_borrow) {
         DisplayGLTexture texture = gl_scanout_borrow(gl_scanout_id);
 
+        cocoa_gl_viewport(size, texture.width, texture.height);
         glBindFramebuffer(GL_FRAMEBUFFER_EXT, 0);
         glBindTexture(GL_TEXTURE_2D, texture.id);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
         qemu_gl_run_texture_blit(dgc.gls, texture.y_0_top);
     } else {
+        cocoa_gl_viewport(size, surface_width(surface), surface_height(surface));
         glBindTexture(GL_TEXTURE_2D, surface->texture);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
         surface_gl_render_texture(dgc.gls, surface);
