@@ -610,8 +610,6 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
 - (void) resizeWindow
 {
-    [[self window] setContentAspectRatio:NSMakeSize(screen.width, screen.height)];
-
     if (!([[self window] styleMask] & NSWindowStyleMaskResizable)) {
         CGFloat width = screen.width / [[self window] backingScaleFactor];
         CGFloat height = screen.height / [[self window] backingScaleFactor];
@@ -621,8 +619,6 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     } else if ([[self window] styleMask] & NSWindowStyleMaskFullScreen) {
         [[self window] setContentSize:[self fixAspectRatio:[self screenSafeAreaSize]]];
         [[self window] center];
-    } else {
-        [[self window] setContentSize:[self fixAspectRatio:[self frame].size]];
     }
 }
 
@@ -680,6 +676,8 @@ static NSRect cocoa_initial_window_frame(void)
     /* Must be called with the BQL, i.e. via updateUIInfo */
     NSSize frameSize;
     QemuUIInfo info = { 0 };
+    static QemuUIInfo sent;
+    static bool hasSent;
 
     if (!qemu_console_is_graphic(dcl.con)) {
         return;
@@ -694,7 +692,25 @@ static NSRect cocoa_initial_window_frame(void)
 
         frameSize = isFullscreen ? [self screenSafeAreaSize] : [self frame].size;
 
-        if (!CVDisplayLinkCreateWithCGDisplay(display, &displayLink)) {
+        /*
+         * The mode the display is in right now is the rate the screen is
+         * actually refreshing at, which a ProMotion panel changes with the
+         * content.  CVDisplayLink's nominal period is a fallback: it reports
+         * the panel's nominal rate and nothing for a display that spells its
+         * period as indefinite.
+         */
+        CGDisplayModeRef displayMode = CGDisplayCopyDisplayMode(display);
+
+        if (displayMode) {
+            double modeRate = CGDisplayModeGetRefreshRate(displayMode);
+
+            CGDisplayModeRelease(displayMode);
+            if (modeRate > 0) {
+                refreshRate = (uint32_t)lround(modeRate * 1000);
+            }
+        }
+
+        if (!refreshRate && !CVDisplayLinkCreateWithCGDisplay(display, &displayLink)) {
             CVTime period = CVDisplayLinkGetNominalOutputVideoRefreshPeriod(displayLink);
             CVDisplayLinkRelease(displayLink);
             if (!(period.flags & kCVTimeIsIndefinite) &&
@@ -736,6 +752,18 @@ static NSRect cocoa_initial_window_frame(void)
                                     [[self window] backingScaleFactor]);
     info.height = cocoa_clean_extent([self convertSizeToBacking:frameSize].height,
                                      [[self window] backingScaleFactor]);
+
+    /*
+     * A guest that adopts the mode makes the window fit that mode, which lands
+     * back here with the same size: sending only what changed makes each
+     * gesture one mode instead of the two ends of that loop.
+     */
+    if (hasSent && !memcmp(&sent, &info, sizeof(info))) {
+        return;
+    }
+
+    sent = info;
+    hasSent = true;
 
     qemu_console_set_ui_info(dcl.con, &info, TRUE);
 }
@@ -1443,6 +1471,14 @@ static NSRect cocoa_initial_window_frame(void)
 }
 
 - (void)windowDidResize:(NSNotification *)notification
+{
+    [cocoaView updateScale];
+    if (![[cocoaView window] inLiveResize]) {
+        [cocoaView updateUIInfo];
+    }
+}
+
+- (void)windowDidEndLiveResize:(NSNotification *)notification
 {
     [cocoaView updateScale];
     [cocoaView updateUIInfo];
