@@ -637,6 +637,41 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     [self updateCursorLayout];
 }
 
+/*
+ * The guest's logical size is the backing size divided by the scale of the
+ * screen the window is on, so the pixels asked for are rounded down to a
+ * multiple of it and the guest's own dimensions come out whole.
+ */
+static uint32_t cocoa_clean_extent(CGFloat extent, CGFloat scale)
+{
+    uint32_t divisor = scale > 1.75 ? 2 : scale > 1.25 ? 3 : 1;
+
+    return MAX(divisor, (uint32_t)extent / divisor * divisor);
+}
+
+/*
+ * The largest 16:9 window that fits comfortably on the screen, centred: the
+ * guest's first mode comes from this window, so opening at 640x480 asks every
+ * guest to start at VGA and resize itself.
+ */
+static NSRect cocoa_initial_window_frame(void)
+{
+    NSScreen *hostScreen = [NSScreen mainScreen];
+
+    if (!hostScreen) {
+        return NSMakeRect(0.0, 0.0, 1280.0, 720.0);
+    }
+
+    NSRect available = [hostScreen visibleFrame];
+    CGFloat unit = floor(MIN(NSWidth(available) * 0.75 / 16.0,
+                             NSHeight(available) * 0.75 / 9.0));
+    NSSize size = NSMakeSize(16.0 * unit, 9.0 * unit);
+
+    return NSMakeRect(floor(NSMidX(available) - size.width / 2.0),
+                      floor(NSMidY(available) - size.height / 2.0),
+                      size.width, size.height);
+}
+
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
@@ -644,7 +679,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 {
     /* Must be called with the BQL, i.e. via updateUIInfo */
     NSSize frameSize;
-    QemuUIInfo info;
+    QemuUIInfo info = { 0 };
 
     if (!qemu_console_is_graphic(dcl.con)) {
         return;
@@ -653,25 +688,42 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     if ([self window]) {
         NSDictionary *description = [[[self window] screen] deviceDescription];
         CGDirectDisplayID display = [[description objectForKey:@"NSScreenNumber"] unsignedIntValue];
-        NSSize screenSize = [[[self window] screen] frame].size;
-        CGSize screenPhysicalSize = CGDisplayScreenSize(display);
         bool isFullscreen = ([[self window] styleMask] & NSWindowStyleMaskFullScreen) != 0;
         CVDisplayLinkRef displayLink;
+        uint32_t refreshRate = 0;
 
         frameSize = isFullscreen ? [self screenSafeAreaSize] : [self frame].size;
 
         if (!CVDisplayLinkCreateWithCGDisplay(display, &displayLink)) {
             CVTime period = CVDisplayLinkGetNominalOutputVideoRefreshPeriod(displayLink);
             CVDisplayLinkRelease(displayLink);
-            if (!(period.flags & kCVTimeIsIndefinite)) {
-                qemu_console_listener_set_refresh(&dcl,
-                                                  1000 * period.timeValue / period.timeScale);
-                info.refresh_rate = (int64_t)1000 * period.timeScale / period.timeValue;
+            if (!(period.flags & kCVTimeIsIndefinite) &&
+                period.timeValue > 0 && period.timeScale > 0) {
+                refreshRate = (uint32_t)1000 * period.timeScale / period.timeValue;
             }
         }
 
-        info.width_mm = frameSize.width / screenSize.width * screenPhysicalSize.width;
-        info.height_mm = frameSize.height / screenSize.height * screenPhysicalSize.height;
+        if (!refreshRate) {
+            NSInteger framesPerSecond = [[[self window] screen] maximumFramesPerSecond];
+
+            if (framesPerSecond > 0) {
+                refreshRate = (uint32_t)framesPerSecond * 1000;
+            }
+        }
+
+        if (refreshRate) {
+            qemu_console_listener_set_refresh(&dcl, MAX(1u, 1000000u / refreshRate));
+            info.refresh_rate = refreshRate;
+        }
+
+        /*
+         * The window's size in points at 110 logical DPI: a guest that reads the
+         * density back lands on scale 1 for a 1x screen and 2 for a 2x one, and a
+         * 1.5x screen lands between them.  Whole centimetres, which is what the
+         * base EDID block can store.
+         */
+        info.width_mm = 10 * MIN(255, MAX(1, (int)lround(frameSize.width * 2.54 / 110.0)));
+        info.height_mm = 10 * MIN(255, MAX(1, (int)lround(frameSize.height * 2.54 / 110.0)));
     } else {
         frameSize = [self frame].size;
         info.width_mm = 0;
@@ -680,8 +732,10 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
     info.xoff = 0;
     info.yoff = 0;
-    info.width = frameSize.width * [[self window] backingScaleFactor];
-    info.height = frameSize.height * [[self window] backingScaleFactor];
+    info.width = cocoa_clean_extent([self convertSizeToBacking:frameSize].width,
+                                    [[self window] backingScaleFactor]);
+    info.height = cocoa_clean_extent([self convertSizeToBacking:frameSize].height,
+                                     [[self window] backingScaleFactor]);
 
     qemu_console_set_ui_info(dcl.con, &info, TRUE);
 }
@@ -1273,7 +1327,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
     self = [super init];
     if (self) {
-        NSRect frame = NSMakeRect(0.0, 0.0, 640.0, 480.0);
+        NSRect frame = cocoa_initial_window_frame();
 
         // create a view and add it to the window
 #ifdef CONFIG_OPENGL
@@ -1363,17 +1417,28 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
 - (void)windowDidChangeScreen:(NSNotification *)notification
 {
+    [cocoaView updateScale];
+    [cocoaView updateUIInfo];
+}
+
+- (void)windowDidChangeBackingProperties:(NSNotification *)notification
+{
+    [cocoaView updateScale];
     [cocoaView updateUIInfo];
 }
 
 - (void)windowDidEnterFullScreen:(NSNotification *)notification
 {
+    [cocoaView updateScale];
+    [cocoaView updateUIInfo];
     [cocoaView grabMouse];
 }
 
 - (void)windowDidExitFullScreen:(NSNotification *)notification
 {
     [cocoaView resizeWindow];
+    [cocoaView updateScale];
+    [cocoaView updateUIInfo];
     [cocoaView ungrabMouse];
 }
 
