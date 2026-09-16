@@ -2296,7 +2296,22 @@ static void cocoa_gl_switch(DisplayChangeListener *dcl,
 
 static void cocoa_gl_render(void)
 {
-    NSSize size = [cocoaView convertSizeToBacking:[cocoaView frame].size];
+    NSSize frameSize = [cocoaView frame].size;
+    NSSize size = [cocoaView convertSizeToBacking:frameSize];
+    CGFloat scale = frameSize.width > 0 ? size.width / frameSize.width : 1.0;
+
+    /*
+     * The drawable is the layer's bounds times its contentsScale, the viewport
+     * is the frame converted to pixels.  A window that moved between displays
+     * of different scale leaves contentsScale behind, and then the drawable is
+     * that factor away from the viewport: everything is drawn into the bottom
+     * left corner of it.  Take the scale from the same conversion the viewport
+     * uses, every frame, so the two cannot disagree.
+     */
+    if (scale > 0 && fabs([[cocoaView layer] contentsScale] - scale) > 0.01) {
+        [[cocoaView layer] setContentsScale:scale];
+    }
+
     GLint filter = qatomic_read(&zoom_interpolation) ? GL_LINEAR : GL_NEAREST;
 
     glViewport(0, 0, size.width, size.height);
