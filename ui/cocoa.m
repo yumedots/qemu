@@ -645,25 +645,24 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 }
 
 /*
- * The guest's logical size is the mode divided by its scale, so the mode is
- * rounded to a multiple of 48, which is what whole logical pixels at a
- * fractional scale cost.
+ * The guest's logical size is the mode divided by the scale its density asks
+ * for, so the mode is rounded to keep that division whole: 1x needs nothing,
+ * 1.5x lines up on threes, 2x on twos.
  */
-static uint32_t cocoa_clean_extent(CGFloat extent)
+static uint32_t cocoa_mode_divisor(CGFloat backingScale)
 {
-    return MAX(48u, (uint32_t)lround(extent / 48.0) * 48u);
+    if (backingScale > 1.75) {
+        return 2;
+    }
+    if (backingScale > 1.25) {
+        return 3;
+    }
+    return 1;
 }
 
-static double cocoa_window_scale(uint32_t width)
+static uint32_t cocoa_mode_extent(CGFloat pixels, uint32_t divisor)
 {
-    NSSize reference = cocoa_initial_window_frame().size;
-    CGFloat backing = [[cocoaView window] backingScaleFactor];
-
-    if (reference.width <= 0 || backing <= 0) {
-        return 1.0;
-    }
-
-    return backing * ((double)width / (reference.width * backing));
+    return MAX(divisor, (uint32_t)pixels / divisor * divisor);
 }
 
 /*
@@ -759,16 +758,23 @@ static NSRect cocoa_initial_window_frame(void)
     info.width_mm = 0;
     info.height_mm = 0;
 
+    NSSize backingFrameSize = [self convertSizeToBacking:frameSize];
+    uint32_t divisor = cocoa_mode_divisor([[self window] backingScaleFactor]);
+
     info.xoff = 0;
     info.yoff = 0;
-    info.width = cocoa_clean_extent([self convertSizeToBacking:frameSize].width);
-    info.height = cocoa_clean_extent([self convertSizeToBacking:frameSize].height);
+    info.width = cocoa_mode_extent(backingFrameSize.width, divisor);
+    info.height = cocoa_mode_extent(backingFrameSize.height, divisor);
 
     if ([self window]) {
-        double scale = cocoa_window_scale(info.width);
-
-        info.width_mm = (int)lround(25.4 * info.width / (110.0 * scale));
-        info.height_mm = (int)lround(25.4 * info.height / (110.0 * scale));
+        /*
+         * The density the guest reads is the window's size on screen, in whole
+         * centimetres because that is the precision a base EDID carries: the
+         * desktop it lays out keeps its size as the window grows, and the
+         * guest gains room to show more of it.
+         */
+        info.width_mm = 10 * MIN(255, MAX(1, (int)lround(frameSize.width * 2.54 / 110.0)));
+        info.height_mm = 10 * MIN(255, MAX(1, (int)lround(frameSize.height * 2.54 / 110.0)));
     }
 
     /*
