@@ -127,6 +127,8 @@ struct _DBusDisplayListener {
     IOSurfaceRef gl_caller;
     bool gl_caller_full;
     bool gl_caller_used;
+    /* the client's surface is there and is not the size of the console */
+    bool gl_caller_odd_size;
     bool gl_caller_reported;
 #endif
 };
@@ -936,6 +938,25 @@ static void dbus_gl_surface_send(DBusDisplayListener *ddl, bool full,
     DisplaySurface *saved;
 
     /*
+     * The client's surface is not the size of the console, which is what the console is
+     * for the frames on either side of a mode change: it is told the size and makes a
+     * surface for it, and the pixels of this frame are the only ones that would have had
+     * to go over the socket.
+     */
+    if (ddl->gl_caller_odd_size) {
+        g_autoptr(GVariant) v_data = g_variant_ref_sink(
+            g_variant_new_from_data(G_VARIANT_TYPE("ay"), NULL, 0, TRUE,
+                                    NULL, NULL));
+
+        ddl_discard_display_messages(ddl);
+        qemu_dbus_display1_listener_call_scanout(
+            ddl->proxy, surface_width(ddl->gl_ds), surface_height(ddl->gl_ds),
+            surface_stride(ddl->gl_ds), surface_format(ddl->gl_ds), v_data,
+            G_DBUS_CALL_FLAGS_NONE, DBUS_DEFAULT_TIMEOUT, NULL, NULL, NULL);
+        return;
+    }
+
+    /*
      * A frame that went into the client's own surface is already there: the
      * geometry goes over and the pixels stay where they were written, which is
      * what keeps the frame off the socket.  The stride is the surface's own,
@@ -1056,10 +1077,12 @@ static void dbus_gl_flip_rows(uint8_t *base, int x, int y, int w, int h,
 static uint8_t *dbus_gl_surface_target(DBusDisplayListener *ddl, size_t *stride)
 {
     ddl->gl_caller_used = false;
+    ddl->gl_caller_odd_size = false;
 
     if (ddl->gl_caller) {
         if (IOSurfaceGetWidth(ddl->gl_caller) != (size_t)surface_width(ddl->gl_ds) ||
             IOSurfaceGetHeight(ddl->gl_caller) != (size_t)surface_height(ddl->gl_ds)) {
+            ddl->gl_caller_odd_size = true;
             if (!ddl->gl_caller_reported) {
                 ddl->gl_caller_reported = true;
                 error_report("dbus: client surface is %zux%zu for a %dx%d console",
