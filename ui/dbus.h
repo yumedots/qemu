@@ -33,6 +33,15 @@
 
 #include "ui/dbus-display1.h"
 
+/*
+ * macOS has no zero copy display handover of its own: the frame is read back
+ * into a surface the client handed over, which is what the client's IOSurface
+ * is for.
+ */
+#if defined(__APPLE__) && defined(CONFIG_OPENGL)
+#define DBUS_GL_SURFACE 1
+#endif
+
 typedef struct DBusClipboardRequest {
     GDBusMethodInvocation *invocation;
     QemuClipboardType type;
@@ -106,6 +115,10 @@ dbus_display_listener_new(const char *bus_name,
 
 DBusDisplayConsole *
 dbus_display_listener_get_console(DBusDisplayListener *ddl);
+
+void
+dbus_display_listener_set_surface(DBusDisplayListener *ddl,
+                                  const char *surface);
 
 const char *
 dbus_display_listener_get_bus_name(DBusDisplayListener *ddl);

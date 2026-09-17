@@ -148,6 +148,9 @@ if dbus_display
                 'dbus-listener.c',
                 'dbus.c',
               ), opengl, gbm, pixman, dbus_display1])
+  if iosurface.found()
+    dbus_ss.add(iosurface)
+  endif
   ui_modules += {'dbus' : dbus_ss}
 endif
 

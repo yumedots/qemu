@@ -217,6 +217,29 @@ dbus_console_set_ui_info(DBusDisplayConsole *ddc,
     return DBUS_METHOD_INVOCATION_HANDLED;
 }
 
+static gboolean
+dbus_console_set_surface(DBusDisplayConsole *ddc,
+                         GDBusMethodInvocation *invocation,
+                         const gchar *arg_surface)
+{
+#ifdef DBUS_GL_SURFACE
+    guint i;
+
+    for (i = 0; i < ddc->listeners->len; i++) {
+        dbus_display_listener_set_surface(g_ptr_array_index(ddc->listeners, i),
+                                          arg_surface);
+    }
+    qemu_dbus_display1_console_complete_set_surface(ddc->iface, invocation);
+#else
+    (void)ddc;
+    g_dbus_method_invocation_return_error(invocation,
+                                          DBUS_DISPLAY_ERROR,
+                                          DBUS_DISPLAY_ERROR_UNSUPPORTED,
+                                          "SetSurface is not supported");
+#endif
+    return DBUS_METHOD_INVOCATION_HANDLED;
+}
+
 #ifdef G_OS_WIN32
 bool
 dbus_win32_import_socket(GDBusMethodInvocation *invocation,
@@ -675,6 +698,8 @@ dbus_display_console_new(DBusDisplay *display, QemuConsole *con)
         dbus_console_register_listener, ddc,
         "swapped-signal::handle-set-uiinfo",
         dbus_console_set_ui_info, ddc,
+        "swapped-signal::handle-set-surface",
+        dbus_console_set_surface, ddc,
         NULL);
     g_dbus_object_skeleton_add_interface(G_DBUS_OBJECT_SKELETON(ddc),
         G_DBUS_INTERFACE_SKELETON(ddc->iface));

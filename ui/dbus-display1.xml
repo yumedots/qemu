@@ -105,6 +105,27 @@
     </method>
 
     <!--
+        SetSurface:
+        @surface: the bootstrap name of an IOSurface, held by the caller, to draw
+                  the console's frames into, or empty to stop using one.
+
+        Hand the console a surface of its own for the frames, so they do not
+        have to be sent over the socket: the surface is read into directly and
+        the listener is told the geometry without the pixels instead.  An
+        IOSurface is not a file descriptor, so the caller publishes its mach
+        port under this name (bootstrap_register) and the console looks it up.
+        The surface must be exactly the console's size, and the caller must not
+        read or write it while the console may be drawing into it.  The console
+        keeps it whole: whatever part of it a later call reports, the whole of
+        it is the current frame.
+
+        Not available on every host: the call fails where it is not.
+    -->
+    <method name="SetSurface">
+      <arg name="surface" type="s" direction="in"/>
+    </method>
+
+    <!--
         Label:
 
         A user-friendly name for the console (for ex: "VGA").

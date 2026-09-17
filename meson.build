@@ -1227,6 +1227,12 @@ cocoa = dependency('appleframeworks',
                    modules: ['Cocoa', 'CoreVideo', 'OpenGL', 'QuartzCore'],
                    required: get_option('cocoa'))
 
+iosurface = not_found
+if host_os == 'darwin'
+  iosurface = dependency('appleframeworks', modules: 'IOSurface',
+                         required: false)
+endif
+
 vmnet = dependency('appleframeworks', modules: 'vmnet', required: get_option('vmnet'))
 if vmnet.found() and not cc.has_header_symbol('vmnet/vmnet.h',
                                               'VMNET_BRIDGED_MODE',

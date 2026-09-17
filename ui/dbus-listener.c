@@ -41,11 +41,12 @@
 #include "ui/egl-context.h"
 #include "ui/qemu-pixman.h"
 #endif
-#include "trace.h"
-
-#if defined(__APPLE__) && defined(CONFIG_OPENGL)
-#define DBUS_GL_SURFACE 1
+#ifdef DBUS_GL_SURFACE
+#include <mach/mach.h>
+#include <servers/bootstrap.h>
+#include <IOSurface/IOSurface.h>
 #endif
+#include "trace.h"
 
 static void dbus_gfx_switch(DisplayChangeListener *dcl,
                             struct DisplaySurface *new_surface);
@@ -59,6 +60,8 @@ static bool dbus_gl_surface_read(DBusDisplayListener *ddl,
                                  int x, int y, int w, int h);
 static void dbus_gl_surface_send(DBusDisplayListener *ddl, bool full,
                                  int x, int y, int w, int h);
+static void dbus_gl_surface_deliver(DBusDisplayListener *ddl,
+                                    int x, int y, int w, int h);
 #endif
 
 enum share_kind {
@@ -121,6 +124,10 @@ struct _DBusDisplayListener {
     int gl_y;
     int gl_width;
     int gl_height;
+    IOSurfaceRef gl_caller;
+    bool gl_caller_full;
+    bool gl_caller_used;
+    bool gl_caller_reported;
 #endif
 };
 
@@ -788,9 +795,7 @@ static void dbus_scanout_update(DisplayChangeListener *dcl,
 #ifdef DBUS_GL_SURFACE
     DBusDisplayListener *ddl = container_of(dcl, DBusDisplayListener, dcl);
 
-    if (dbus_gl_surface_read(ddl, x, y, w, h)) {
-        dbus_gl_surface_send(ddl, false, x, y, w, h);
-    }
+    dbus_gl_surface_deliver(ddl, x, y, w, h);
 #endif
     dbus_call_update_gl(dcl, x, y, w, h);
 }
@@ -810,11 +815,8 @@ static void dbus_gl_refresh(DisplayChangeListener *dcl)
             pixman_box32_t *box;
 
             box = pixman_region32_rectangles(&ddl->gl_damage, NULL) + i;
-            if (dbus_gl_surface_read(ddl, box->x1, box->y1,
-                                     box->x2 - box->x1, box->y2 - box->y1)) {
-                dbus_gl_surface_send(ddl, false, box->x1, box->y1,
-                                     box->x2 - box->x1, box->y2 - box->y1);
-            }
+            dbus_gl_surface_deliver(ddl, box->x1, box->y1,
+                                    box->x2 - box->x1, box->y2 - box->y1);
         }
         pixman_region32_clear(&ddl->gl_damage);
 #endif
@@ -931,8 +933,35 @@ static void ddl_scanout(DBusDisplayListener *ddl)
 static void dbus_gl_surface_send(DBusDisplayListener *ddl, bool full,
                                  int x, int y, int w, int h)
 {
-    DisplaySurface *saved = ddl->ds;
+    DisplaySurface *saved;
 
+    /*
+     * A frame that went into the client's own surface is already there: the
+     * geometry goes over and the pixels stay where they were written, which is
+     * what keeps the frame off the socket.  The stride is the surface's own,
+     * which a client with a padded row does not have to guess at.
+     */
+    if (ddl->gl_caller_used) {
+        g_autoptr(GVariant) v_data = g_variant_ref_sink(
+            g_variant_new_from_data(G_VARIANT_TYPE("ay"), NULL, 0, TRUE,
+                                    NULL, NULL));
+        size_t stride = IOSurfaceGetBytesPerRow(ddl->gl_caller);
+
+        if (full) {
+            ddl_discard_display_messages(ddl);
+            qemu_dbus_display1_listener_call_scanout(
+                ddl->proxy, w, h, stride, surface_format(ddl->gl_ds), v_data,
+                G_DBUS_CALL_FLAGS_NONE, DBUS_DEFAULT_TIMEOUT, NULL, NULL, NULL);
+        } else {
+            qemu_dbus_display1_listener_call_update(
+                ddl->proxy, x, y, w, h, stride, surface_format(ddl->gl_ds),
+                v_data, G_DBUS_CALL_FLAGS_NONE, DBUS_DEFAULT_TIMEOUT, NULL,
+                NULL, NULL);
+        }
+        return;
+    }
+
+    saved = ddl->ds;
     ddl->ds = ddl->gl_ds;
     if (full) {
         ddl_scanout(ddl);
@@ -1018,12 +1047,77 @@ static void dbus_gl_flip_rows(uint8_t *base, int x, int y, int w, int h,
     g_free(tmp);
 }
 
+/*
+ * Where the pixels go: the surface the client handed over when it is there and
+ * the size of the console, and the software surface otherwise.  The caller's
+ * surface is locked for as long as the read takes, which is also what a client
+ * reading it back sees as busy.
+ */
+static uint8_t *dbus_gl_surface_target(DBusDisplayListener *ddl, size_t *stride)
+{
+    ddl->gl_caller_used = false;
+
+    if (ddl->gl_caller) {
+        if (IOSurfaceGetWidth(ddl->gl_caller) != (size_t)surface_width(ddl->gl_ds) ||
+            IOSurfaceGetHeight(ddl->gl_caller) != (size_t)surface_height(ddl->gl_ds)) {
+            if (!ddl->gl_caller_reported) {
+                ddl->gl_caller_reported = true;
+                error_report("dbus: client surface is %zux%zu for a %dx%d console",
+                             IOSurfaceGetWidth(ddl->gl_caller),
+                             IOSurfaceGetHeight(ddl->gl_caller),
+                             surface_width(ddl->gl_ds),
+                             surface_height(ddl->gl_ds));
+            }
+        } else {
+            IOReturn locked = IOSurfaceLock(ddl->gl_caller, 0, NULL);
+
+            if (locked != kIOReturnSuccess) {
+                if (!ddl->gl_caller_reported) {
+                    ddl->gl_caller_reported = true;
+                    error_report("dbus: client surface is busy (%d)", locked);
+                }
+            } else {
+                *stride = IOSurfaceGetBytesPerRow(ddl->gl_caller);
+                ddl->gl_caller_used = true;
+                return IOSurfaceGetBaseAddress(ddl->gl_caller);
+            }
+        }
+    }
+
+    *stride = surface_stride(ddl->gl_ds);
+    return surface_data(ddl->gl_ds);
+}
+
+/*
+ * One frame, for a client that handed a surface over: it is kept whole, so the
+ * first read after a new surface is the whole of it even when the damage that
+ * asked for it is one corner, and only the damage after that.
+ */
+static void dbus_gl_surface_deliver(DBusDisplayListener *ddl,
+                                    int x, int y, int w, int h)
+{
+    if (!ddl->gl_ds) {
+        return;
+    }
+    if (ddl->gl_caller_full) {
+        x = 0;
+        y = 0;
+        w = surface_width(ddl->gl_ds);
+        h = surface_height(ddl->gl_ds);
+    }
+    if (dbus_gl_surface_read(ddl, x, y, w, h)) {
+        ddl->gl_caller_full = false;
+        dbus_gl_surface_send(ddl, false, x, y, w, h);
+    }
+}
+
 static bool dbus_gl_surface_read(DBusDisplayListener *ddl,
                                  int x, int y, int w, int h)
 {
     const DBusGLESOps *gles = dbus_gles_ops();
     EGLContext context = eglGetCurrentContext();
     size_t stride;
+    uint8_t *base;
     uint8_t *row;
     int line;
 
@@ -1078,23 +1172,24 @@ static bool dbus_gl_surface_read(DBusDisplayListener *ddl,
 
     /*
      * The damage rect of the borrowed texture lands in the same place of the
-     * software surface, which is the one the client is sent.  GL ES has no row
-     * length, so a partial read goes through a packed buffer first.
+     * surface it is read into, whichever that is, so a client drawing that
+     * surface sees one picture and not a patch of another.
      */
     /*
-     * GL ES has no GL_BGRA to read into, and the software surface is BGRA, so the
-     * channels come back swapped and are put back in place.
+     * GL ES has no GL_BGRA to read into and no row length either, so the
+     * channels come back swapped and the rows packed: both surfaces are BGRA,
+     * and a destination with a wider row than the read is filled row by row.
      */
-    stride = surface_stride(ddl->gl_ds);
-    row = surface_data(ddl->gl_ds) + (size_t)y * stride + (size_t)x * 4;
-    if (x == 0 && w == surface_width(ddl->gl_ds)) {
+    base = dbus_gl_surface_target(ddl, &stride);
+    row = base + (size_t)y * stride + (size_t)x * 4;
+    if ((size_t)w * 4 == stride) {
         gles->read_pixels(ddl->gl_x, ddl->gl_y + y, w, h,
                           GL_RGBA, GL_UNSIGNED_BYTE, row);
         for (line = 0; line < h; line++) {
             dbus_gl_swap_red_blue(row + (size_t)line * stride, w);
         }
         if (ddl->gl_y_0_top) {
-            dbus_gl_flip_rows(surface_data(ddl->gl_ds), x, y, w, h, stride);
+            dbus_gl_flip_rows(base, x, y, w, h, stride);
         }
     } else {
         ddl->gl_buffer = g_realloc(ddl->gl_buffer, (size_t)w * h * 4);
@@ -1118,6 +1213,9 @@ static bool dbus_gl_surface_read(DBusDisplayListener *ddl,
             ddl->gl_reported = true;
             error_report("dbus: frame buffer read back failed (0x%x)", error);
         }
+    }
+    if (ddl->gl_caller_used) {
+        IOSurfaceUnlock(ddl->gl_caller, 0, NULL);
     }
 
     return true;
@@ -1148,9 +1246,12 @@ static void dbus_gl_surface_attach(DBusDisplayListener *ddl,
     ddl->gl_y = y;
     ddl->gl_width = backing_width;
     ddl->gl_height = backing_height;
+    /* a new scanout is a new chance to say what went wrong with the last one */
+    ddl->gl_reported = false;
 
     /* what could not be read is not sent: a blank surface is not the guest's */
     if (dbus_gl_surface_read(ddl, 0, 0, w, h)) {
+        ddl->gl_caller_full = false;
         dbus_gl_surface_send(ddl, true, 0, 0, w, h);
     }
 }
@@ -1306,6 +1407,12 @@ dbus_display_listener_dispose(GObject *object)
 #endif
 #else /* !WIN32 */
     g_clear_object(&ddl->scanout_dmabuf_v2_proxy);
+#endif
+#ifdef DBUS_GL_SURFACE
+    if (ddl->gl_caller) {
+        CFRelease(ddl->gl_caller);
+        ddl->gl_caller = NULL;
+    }
 #endif
 #ifdef CONFIG_PIXMAN
     pixman_region32_fini(&ddl->gl_damage);
@@ -1571,6 +1678,43 @@ dbus_filter(GDBusConnection *connection,
     }
 
     return message;
+}
+
+void
+dbus_display_listener_set_surface(DBusDisplayListener *ddl, const char *name)
+{
+#ifdef DBUS_GL_SURFACE
+    char service[128] = "";
+    mach_port_t port = MACH_PORT_NULL;
+    IOSurfaceRef surface = NULL;
+    kern_return_t result;
+
+    if (name) {
+        snprintf(service, sizeof(service), "%s", name);
+    }
+    if (service[0]) {
+        result = bootstrap_look_up(bootstrap_port, service, &port);
+        if (result != KERN_SUCCESS) {
+            error_report("dbus: no IOSurface published as %s (%d)", service,
+                         result);
+        } else {
+            surface = IOSurfaceLookupFromMachPort(port);
+            mach_port_deallocate(mach_task_self(), port);
+            if (!surface) {
+                error_report("dbus: %s is not an IOSurface", service);
+            }
+        }
+    }
+    if (ddl->gl_caller) {
+        CFRelease(ddl->gl_caller);
+    }
+    ddl->gl_caller = surface;
+    ddl->gl_caller_full = surface != NULL;
+    ddl->gl_caller_reported = false;
+#else
+    (void)ddl;
+    (void)name;
+#endif
 }
 
 DBusDisplayListener *
