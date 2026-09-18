@@ -26,6 +26,7 @@
 #include "qapi/error.h"
 #include "system/system.h"
 #include "dbus.h"
+#include "dbus-surface.h"
 #include "glib.h"
 #ifdef G_OS_UNIX
 #include <gio/gunixfdlist.h>
@@ -1032,40 +1033,17 @@ static const DBusGLESOps *dbus_gles_ops(void)
     return &ops;
 }
 
-static void dbus_gl_swap_red_blue(uint8_t *pixels, int width)
+typedef struct DBusGLRead {
+    const DBusGLESOps *gles;
+    int x, y, w, h;
+} DBusGLRead;
+
+static void dbus_gl_read(void *opaque, uint8_t *into)
 {
-    int i;
+    DBusGLRead *read = opaque;
 
-    for (i = 0; i < width; i++) {
-        uint8_t red = pixels[i * 4];
-
-        pixels[i * 4] = pixels[i * 4 + 2];
-        pixels[i * 4 + 2] = red;
-    }
-}
-
-/*
- * Rows come back bottom up, so a texture that says its first row is the top one
- * (VIRTIO_GPU_RESOURCE_FLAG_Y_0_TOP) is handed over the other way round, which
- * is the turn over the software path of the same frame does not need.
- */
-static void dbus_gl_flip_rows(uint8_t *base, int x, int y, int w, int h,
-                              size_t stride)
-{
-    uint8_t *tmp = g_malloc((size_t)w * 4);
-    int line;
-
-    for (line = 0; line < h / 2; line++) {
-        uint8_t *top = base + (size_t)(y + line) * stride + (size_t)x * 4;
-        uint8_t *bottom = base + (size_t)(y + h - 1 - line) * stride +
-                          (size_t)x * 4;
-
-        memcpy(tmp, top, (size_t)w * 4);
-        memcpy(top, bottom, (size_t)w * 4);
-        memcpy(bottom, tmp, (size_t)w * 4);
-    }
-
-    g_free(tmp);
+    read->gles->read_pixels(read->x, read->y, read->w, read->h,
+                            GL_RGBA, GL_UNSIGNED_BYTE, into);
 }
 
 /*
@@ -1142,7 +1120,7 @@ static bool dbus_gl_surface_read(DBusDisplayListener *ddl,
     size_t stride;
     uint8_t *base;
     uint8_t *row;
-    int line;
+    DBusGLRead read;
 
     if (!ddl->gl_ds || !ddl->gl_texture || !gles->gen_framebuffers) {
         return false;
@@ -1198,37 +1176,14 @@ static bool dbus_gl_surface_read(DBusDisplayListener *ddl,
      * surface it is read into, whichever that is, so a client drawing that
      * surface sees one picture and not a patch of another.
      */
-    /*
-     * GL ES has no GL_BGRA to read into and no row length either, so the
-     * channels come back swapped and the rows packed: both surfaces are BGRA,
-     * and a destination with a wider row than the read is filled row by row.
-     */
     base = dbus_gl_surface_target(ddl, &stride);
     row = base + (size_t)y * stride + (size_t)x * 4;
-    if ((size_t)w * 4 == stride) {
-        gles->read_pixels(ddl->gl_x, ddl->gl_y + y, w, h,
-                          GL_RGBA, GL_UNSIGNED_BYTE, row);
-        for (line = 0; line < h; line++) {
-            dbus_gl_swap_red_blue(row + (size_t)line * stride, w);
-        }
-        if (ddl->gl_y_0_top) {
-            dbus_gl_flip_rows(base, x, y, w, h, stride);
-        }
-    } else {
-        ddl->gl_buffer = g_realloc(ddl->gl_buffer, (size_t)w * h * 4);
-        gles->read_pixels(ddl->gl_x + x, ddl->gl_y + y, w, h,
-                          GL_RGBA, GL_UNSIGNED_BYTE, ddl->gl_buffer);
-        for (line = 0; line < h; line++) {
-            dbus_gl_swap_red_blue(ddl->gl_buffer + (size_t)line * w * 4, w);
-        }
-        if (ddl->gl_y_0_top) {
-            dbus_gl_flip_rows(ddl->gl_buffer, 0, 0, w, h, (size_t)w * 4);
-        }
-        for (line = 0; line < h; line++) {
-            memcpy(row + (size_t)line * stride,
-                   ddl->gl_buffer + (size_t)line * w * 4, (size_t)w * 4);
-        }
-    }
+    ddl->gl_buffer = g_realloc(ddl->gl_buffer, (size_t)w * h * 4);
+    read = (DBusGLRead) {
+        gles, ddl->gl_x + x, ddl->gl_y + y, w, h,
+    };
+    dbus_gl_read_into_surface(row, stride, ddl->gl_buffer, w, h, ddl->gl_y_0_top,
+                              dbus_gl_read, &read);
     if (gles->get_error && !ddl->gl_reported) {
         GLenum error = gles->get_error();
 
