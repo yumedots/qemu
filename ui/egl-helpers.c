@@ -30,12 +30,6 @@ EGLConfig qemu_egl_config;
 DisplayGLMode qemu_egl_mode;
 bool qemu_egl_angle_d3d;
 
-#ifndef EGL_PLATFORM_ANGLE_ANGLE
-#define EGL_PLATFORM_ANGLE_ANGLE 0x3202
-#define EGL_PLATFORM_ANGLE_TYPE_ANGLE 0x3203
-#define EGL_PLATFORM_ANGLE_TYPE_OPENGL_ANGLE 0x320D
-#endif
-
 /* ------------------------------------------------------------------ */
 
 const char *qemu_egl_get_error_string(void)
@@ -130,6 +124,11 @@ void egl_fb_setup_for_tex(egl_fb *fb, int width, int height,
     glBindFramebuffer(GL_FRAMEBUFFER_EXT, fb->framebuffer);
     glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT,
                               GL_TEXTURE_2D, fb->texture, 0);
+    GLenum status = glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT);
+    if (status != GL_FRAMEBUFFER_COMPLETE_EXT) {
+        fprintf(stderr, "egl_fb_setup_for_tex: FBO incomplete! tex=%u status=0x%x err=0x%x\n",
+                texture, status, glGetError());
+    }
 }
 
 void egl_fb_setup_new_tex(egl_fb *fb, int width, int height)
@@ -139,7 +138,7 @@ void egl_fb_setup_new_tex(egl_fb *fb, int width, int height)
     glGenTextures(1, &texture);
     glBindTexture(GL_TEXTURE_2D, texture);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height,
-                 0, GL_BGRA, GL_UNSIGNED_BYTE, 0);
+                 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
 
     egl_fb_setup_for_tex(fb, width, height, texture, true);
 }
@@ -473,7 +472,7 @@ int egl_create_fence(EGLSyncKHR sync)
 
 /* ---------------------------------------------------------------------- */
 
-EGLSurface qemu_egl_init_surface(EGLContext ectx, EGLNativeWindowType win)
+EGLSurface qemu_egl_init_surface_x11(EGLContext ectx, EGLNativeWindowType win)
 {
     EGLSurface esurface;
     EGLBoolean b;
@@ -496,8 +495,37 @@ EGLSurface qemu_egl_init_surface(EGLContext ectx, EGLNativeWindowType win)
 }
 
 /* ---------------------------------------------------------------------- */
-/* ---------------------------------------------------------------------- */
 
+#if defined(CONFIG_X11) || defined(CONFIG_GBM) || defined(WIN32) || defined(CONFIG_COCOA)
+
+/*
+ * Taken from glamor_egl.h from the Xorg xserver, which is MIT licensed
+ *
+ * Create an EGLDisplay from a native display type. This is a little quirky
+ * for a few reasons.
+ *
+ * 1: GetPlatformDisplayEXT and GetPlatformDisplay are the API you want to
+ * use, but have different function signatures in the third argument; this
+ * happens not to matter for us, at the moment, but it means epoxy won't alias
+ * them together.
+ *
+ * 2: epoxy 1.3 and earlier don't understand EGL client extensions, which
+ * means you can't call "eglGetPlatformDisplayEXT" directly, as the resolver
+ * will crash.
+ *
+ * 3: You can't tell whether you have EGL 1.5 at this point, because
+ * eglQueryString(EGL_VERSION) is a property of the display, which we don't
+ * have yet. So you have to query for extensions no matter what. Fortunately
+ * epoxy_has_egl_extension _does_ let you query for client extensions, so
+ * we don't have to write our own extension string parsing.
+ *
+ * 4. There is no EGL_KHR_platform_base to complement the EXT one, thus one
+ * needs to know EGL 1.5 is supported in order to use the eglGetPlatformDisplay
+ * function pointer.
+ * We can workaround this (circular dependency) by probing for the EGL 1.5
+ * platform extensions (EGL_KHR_platform_gbm and friends) yet it doesn't seem
+ * like mesa will be able to advertise these (even though it can do EGL 1.5).
+ */
 EGLDisplay qemu_egl_get_display(EGLNativeDisplayType native,
                                 EGLenum platform)
 {
@@ -506,7 +534,7 @@ EGLDisplay qemu_egl_get_display(EGLNativeDisplayType native,
     /* In practise any EGL 1.5 implementation would support the EXT extension */
     if (epoxy_has_egl_extension(NULL, "EGL_EXT_platform_base")) {
         if (platform != 0) {
-            dpy = eglGetPlatformDisplayEXT(platform, (void *)(intptr_t)native, NULL);
+            dpy = eglGetPlatformDisplayEXT(platform, (void *)(uintptr_t)native, NULL);
         }
     }
 
@@ -517,27 +545,9 @@ EGLDisplay qemu_egl_get_display(EGLNativeDisplayType native,
     return dpy;
 }
 
-static int qemu_egl_configure_display(DisplayGLMode mode);
-
-static int qemu_egl_setup_display(EGLDisplay dpy, DisplayGLMode mode)
-{
-    if (dpy == EGL_NO_DISPLAY) {
-        error_report("egl: eglGetDisplay failed: %s", qemu_egl_get_error_string());
-        return -1;
-    }
-
-    qemu_egl_display = dpy;
-    return qemu_egl_configure_display(mode);
-}
-
 static int qemu_egl_init_dpy(EGLNativeDisplayType dpy,
                              EGLenum platform,
                              DisplayGLMode mode)
-{
-    return qemu_egl_setup_display(qemu_egl_get_display(dpy, platform), mode);
-}
-
-static int qemu_egl_configure_display(DisplayGLMode mode)
 {
     static const EGLint conf_att_core[] = {
         EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
@@ -561,6 +571,12 @@ static int qemu_egl_configure_display(DisplayGLMode mode)
     EGLBoolean b;
     EGLint n;
     bool gles = (mode == DISPLAY_GL_MODE_ES);
+
+    qemu_egl_display = qemu_egl_get_display(dpy, platform);
+    if (qemu_egl_display == EGL_NO_DISPLAY) {
+        error_report("egl: eglGetDisplay failed: %s", qemu_egl_get_error_string());
+        return -1;
+    }
 
     b = eglInitialize(qemu_egl_display, &major, &minor);
     if (b == EGL_FALSE) {
@@ -588,10 +604,7 @@ static int qemu_egl_configure_display(DisplayGLMode mode)
     return 0;
 }
 
-int qemu_egl_init_dpy_cocoa(DisplayGLMode mode)
-{
-    return qemu_egl_init_dpy(EGL_DEFAULT_DISPLAY, 0, mode);
-}
+#endif
 
 #if defined(CONFIG_X11) || defined(CONFIG_GBM)
 int qemu_egl_init_dpy_x11(EGLNativeDisplayType dpy, DisplayGLMode mode)
@@ -610,6 +623,25 @@ int qemu_egl_init_dpy_mesa(EGLNativeDisplayType dpy, DisplayGLMode mode)
 #else
     return qemu_egl_init_dpy(dpy, 0, mode);
 #endif
+}
+#endif
+
+#ifdef CONFIG_COCOA
+int qemu_egl_init_dpy_cocoa(EGLNativeDisplayType dpy, DisplayGLMode mode)
+{
+    /*
+     * ANGLE provides EGL on macOS via Metal.  It only supports GL ES,
+     * so force ES mode if the caller requested core GL.
+     */
+    if (mode == DISPLAY_GL_MODE_ON) {
+        mode = DISPLAY_GL_MODE_ES;
+    }
+
+    if (qemu_egl_init_dpy(dpy, 0, mode) < 0) {
+        return -1;
+    }
+
+    return 0;
 }
 #endif
 
@@ -701,7 +733,18 @@ bool egl_init(const char *rendernode, DisplayGLMode mode, Error **errp)
         return false;
     }
 
-#ifdef WIN32
+#if defined(CONFIG_COCOA)
+    /* ANGLE on macOS: use default display, force GL ES */
+    if (qemu_egl_init_dpy_cocoa(EGL_DEFAULT_DISPLAY, mode) < 0) {
+        error_setg(errp, "egl: cocoa/ANGLE init failed");
+        return false;
+    }
+    qemu_egl_rn_ctx = qemu_egl_init_ctx();
+    if (!qemu_egl_rn_ctx) {
+        error_setg(errp, "egl: egl_init_ctx failed");
+        return false;
+    }
+#elif defined(WIN32)
     if (qemu_egl_init_dpy_win32(EGL_DEFAULT_DISPLAY, mode) < 0) {
         error_setg(errp, "egl: init failed");
         return false;
@@ -716,21 +759,6 @@ bool egl_init(const char *rendernode, DisplayGLMode mode, Error **errp)
         error_setg(errp, "egl: render node init failed");
         return false;
     }
-#elif defined(__APPLE__)
-    /* ANGLE has no core profile config on Apple, GL ES is what it renders */
-    if (mode == DISPLAY_GL_MODE_ON) {
-        mode = DISPLAY_GL_MODE_ES;
-    }
-    if (qemu_egl_init_dpy_cocoa(mode) < 0) {
-        error_setg(errp, "egl: init failed");
-        return false;
-    }
-    qemu_egl_rn_ctx = qemu_egl_init_ctx();
-    if (!qemu_egl_rn_ctx) {
-        error_setg(errp, "egl: egl_init_ctx failed");
-        return false;
-    }
-    qemu_egl_angle_dispatch();
 #endif
 
     if (!qemu_egl_rn_ctx) {
@@ -763,78 +791,3 @@ void egl_cleanup(void)
     g_clear_fd(&qemu_egl_rn_fd, NULL);
 #endif
 }
-
-#ifdef __APPLE__
-/*
- * libepoxy resolves GL through the platform's own GL library, which on macOS is not
- * the one that owns the context: ANGLE's.  Calls would then run against a library with
- * no current context of its own.  Take the entry points the display path uses from the
- * EGL display instead, so they and the context belong to the same implementation.
- */
-#define QEMU_ANGLE_GL(name)                                                  \
-    do {                                                                     \
-        void *proc = (void *)eglGetProcAddress(#name);                        \
-        if (proc) {                                                           \
-            epoxy_##name = (__typeof__(epoxy_##name))proc;                    \
-        }                                                                     \
-    } while (0)
-
-void qemu_egl_angle_dispatch(void)
-{
-    QEMU_ANGLE_GL(glAttachShader);
-    QEMU_ANGLE_GL(glBindBuffer);
-    QEMU_ANGLE_GL(glBindFramebuffer);
-    QEMU_ANGLE_GL(glBindTexture);
-    QEMU_ANGLE_GL(glBindVertexArray);
-    QEMU_ANGLE_GL(glBlendFunc);
-    QEMU_ANGLE_GL(glBlitFramebuffer);
-    QEMU_ANGLE_GL(glBufferData);
-    QEMU_ANGLE_GL(glCheckFramebufferStatus);
-    QEMU_ANGLE_GL(glClear);
-    QEMU_ANGLE_GL(glClearColor);
-    QEMU_ANGLE_GL(glCompileShader);
-    QEMU_ANGLE_GL(glCreateProgram);
-    QEMU_ANGLE_GL(glCreateShader);
-    QEMU_ANGLE_GL(glDeleteFramebuffers);
-    QEMU_ANGLE_GL(glDeleteProgram);
-    QEMU_ANGLE_GL(glDeleteShader);
-    QEMU_ANGLE_GL(glDeleteTextures);
-    QEMU_ANGLE_GL(glDisable);
-    QEMU_ANGLE_GL(glDrawArrays);
-    QEMU_ANGLE_GL(glEGLImageTargetTexture2DOES);
-    QEMU_ANGLE_GL(glEnable);
-    QEMU_ANGLE_GL(glEnableVertexAttribArray);
-    QEMU_ANGLE_GL(glFinish);
-    QEMU_ANGLE_GL(glFlush);
-    QEMU_ANGLE_GL(glFramebufferTexture2D);
-    QEMU_ANGLE_GL(glFramebufferTexture2DEXT);
-    QEMU_ANGLE_GL(glGenBuffers);
-    QEMU_ANGLE_GL(glGenFramebuffers);
-    QEMU_ANGLE_GL(glGenTextures);
-    QEMU_ANGLE_GL(glGenVertexArrays);
-    QEMU_ANGLE_GL(glGetAttribLocation);
-    QEMU_ANGLE_GL(glGetBooleanv);
-    QEMU_ANGLE_GL(glGetError);
-    QEMU_ANGLE_GL(glGetFloatv);
-    QEMU_ANGLE_GL(glGetIntegerv);
-    QEMU_ANGLE_GL(glGetString);
-    QEMU_ANGLE_GL(glGetStringi);
-    QEMU_ANGLE_GL(glGetTexLevelParameteriv);
-    QEMU_ANGLE_GL(glGetProgramInfoLog);
-    QEMU_ANGLE_GL(glGetProgramiv);
-    QEMU_ANGLE_GL(glGetShaderInfoLog);
-    QEMU_ANGLE_GL(glGetShaderiv);
-    QEMU_ANGLE_GL(glLinkProgram);
-    QEMU_ANGLE_GL(glMapBufferRange);
-    QEMU_ANGLE_GL(glPixelStorei);
-    QEMU_ANGLE_GL(glReadBuffer);
-    QEMU_ANGLE_GL(glReadPixels);
-    QEMU_ANGLE_GL(glShaderSource);
-    QEMU_ANGLE_GL(glTexImage2D);
-    QEMU_ANGLE_GL(glTexParameteri);
-    QEMU_ANGLE_GL(glTexSubImage2D);
-    QEMU_ANGLE_GL(glUseProgram);
-    QEMU_ANGLE_GL(glVertexAttribPointer);
-    QEMU_ANGLE_GL(glViewport);
-}
-#endif

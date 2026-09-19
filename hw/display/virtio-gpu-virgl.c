@@ -50,7 +50,8 @@
  * accelerator to re-map guest memory.
  */
 #define VIRGL_HAS_MAP_FIXED \
-    (VIRGL_CHECK_VERSION(1, 3, 0) && !IS_ENABLED(CONFIG_WIN32) && !defined(__APPLE__))
+    (VIRGL_CHECK_VERSION(1, 3, 0) && !IS_ENABLED(CONFIG_WIN32) && \
+     !IS_ENABLED(CONFIG_DARWIN))
 
 struct virtio_gpu_virgl_resource {
     struct virtio_gpu_simple_resource base;
@@ -676,9 +677,9 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
                         ss.r.width, ss.r.height);
     virgl_renderer_force_ctx_0();
     qemu_console_gl_scanout_texture(
-        g->parent_obj.scanout[ss.scanout_id].con, ss.resource_id,
-        virgl_borrow_texture_for_scanout,
-        ss.r.x, ss.r.y, ss.r.width, ss.r.height);
+        g->parent_obj.scanout[ss.scanout_id].con, texture.id,
+        texture.y_0_top, texture.width, texture.height,
+        ss.r.x, ss.r.y, ss.r.width, ss.r.height, NULL);
     g->parent_obj.scanout[ss.scanout_id].resource_id = ss.resource_id;
 }
 
@@ -1590,7 +1591,16 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
 #endif
 
     ret = virgl_renderer_init(g, flags, &virtio_gpu_3d_cbs);
-    if (ret != 0) {
+    if (ret == -EBUSY) {
+        /*
+         * Renderer already initialized from a prior call (e.g. before our
+         * deferred cocoa egl_init set qemu_egl_display, the first call
+         * succeeded with version=3/flags=0; after egl_init, this call
+         * uses version=4/flags=THREAD_SYNC|ASYNC_FENCE_CB and virgl
+         * refuses the mismatch).  The renderer is fully operational —
+         * just re-create the timers and bottom-halfs below.
+         */
+    } else if (ret != 0) {
         error_report("virgl could not be initialized: %d", ret);
         return ret;
     }

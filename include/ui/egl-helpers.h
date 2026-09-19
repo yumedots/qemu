@@ -61,7 +61,7 @@ int egl_create_fence(EGLSyncKHR sync);
 
 EGLSurface qemu_egl_init_surface(EGLContext ectx, EGLNativeWindowType win);
 
-int qemu_egl_init_dpy_cocoa(DisplayGLMode mode);
+int qemu_egl_init_dpy_cocoa(EGLNativeDisplayType dpy, DisplayGLMode mode);
 
 #ifdef __APPLE__
 int qemu_egl_init_dpy_angle(DisplayGLMode mode);

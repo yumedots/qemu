@@ -85,16 +85,15 @@ static void egl_scanout_imported_texture(DisplayChangeListener *dcl,
 
 static void egl_scanout_texture(DisplayChangeListener *dcl,
                                 uint32_t backing_id,
-                                DisplayGLTextureBorrower backing_borrow,
+                                bool backing_y_0_top,
+                                uint32_t backing_width,
+                                uint32_t backing_height,
                                 uint32_t x, uint32_t y,
-                                uint32_t w, uint32_t h)
+                                uint32_t w, uint32_t h,
+                                void *d3d_tex2d)
 {
-    DisplayGLTexture backing_texture = backing_borrow(backing_id);
-
-    egl_scanout_imported_texture(dcl, backing_texture.id,
-                                 backing_texture.y_0_top,
-                                 backing_texture.width,
-                                 backing_texture.height);
+    egl_scanout_imported_texture(dcl, backing_id, backing_y_0_top,
+                                 backing_width, backing_height);
 }
 
 #ifdef CONFIG_GBM
