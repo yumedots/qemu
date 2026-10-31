@@ -1068,12 +1068,19 @@
 ##
 # @InputAxis:
 #
-# Position axis of a pointer input device (mouse, tablet).
+# Position or high-resolution wheel axis of a pointer input device.
+#
+# @wheel: vertical high-resolution wheel movement in Linux v120 units
+#     (Try Omarchy downstream)
+#
+# @hwheel: horizontal high-resolution wheel movement in Linux v120
+#     units
+#     (Try Omarchy downstream)
 #
 # Since: 2.0
 ##
 { 'enum'  : 'InputAxis',
-  'data'  : [ 'x', 'y' ] }
+  'data'  : [ 'x', 'y', 'wheel', 'hwheel' ] }
 
 ##
 # @InputMultiTouchType:

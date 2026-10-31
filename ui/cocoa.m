@@ -38,6 +38,7 @@
 #include "ui/console.h"
 #include "ui/input.h"
 #include "ui/cocoa-pinch.h"
+#include "ui/cocoa-scroll.h"
 #include "ui/kbd-state.h"
 #include "system/system.h"
 #include "system/runstate.h"
@@ -353,6 +354,7 @@ static void handleAnyDeviceErrors(Error * err)
     int mouseY;
     bool mouseOn;
     CocoaPinch pinch;
+    CocoaScroll scroll;
 }
 - (void) grabMouse;
 - (void) ungrabMouse;
@@ -1201,7 +1203,32 @@ static void cocoa_pinch_send_frame(void *opaque, const CocoaPinchFrame *frame)
              * This is in-line with standard Mac OS X UI behaviour.
              */
 
-            /* Determine if this is a scroll up or scroll down event */
+            if ([event hasPreciseScrollingDeltas]) {
+                CocoaScrollFrame frame;
+
+                if (([event phase] & NSEventPhaseCancelled) ||
+                    ([event momentumPhase] & NSEventPhaseCancelled)) {
+                    cocoa_scroll_cancel(&scroll);
+                    return true;
+                }
+
+                frame = cocoa_scroll_update(&scroll,
+                                            [event scrollingDeltaX],
+                                            [event scrollingDeltaY]);
+                /* Cocoa's positive X means left; Linux REL_HWHEEL is right. */
+                if (frame.x) {
+                    qemu_input_queue_rel(dcl.con, INPUT_AXIS_HWHEEL, -frame.x);
+                }
+                if (frame.y) {
+                    qemu_input_queue_rel(dcl.con, INPUT_AXIS_WHEEL, frame.y);
+                }
+                if (frame.x || frame.y) {
+                    qemu_input_event_sync();
+                }
+                return true;
+            }
+
+            /* Preserve discrete mouse-wheel behavior exactly. */
             if ([event deltaY] != 0) {
                 button = ([event deltaY] > 0) ?
                     INPUT_BUTTON_WHEEL_UP : INPUT_BUTTON_WHEEL_DOWN;

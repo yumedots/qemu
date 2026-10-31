@@ -39,6 +39,8 @@ static const unsigned short keymap_button[INPUT_BUTTON__MAX] = {
 static const unsigned short axismap_rel[INPUT_AXIS__MAX] = {
     [INPUT_AXIS_X]                   = REL_X,
     [INPUT_AXIS_Y]                   = REL_Y,
+    [INPUT_AXIS_WHEEL]               = REL_WHEEL_HI_RES,
+    [INPUT_AXIS_HWHEEL]              = REL_HWHEEL_HI_RES,
 };
 
 static const unsigned short axismap_abs[INPUT_AXIS__MAX] = {
@@ -84,6 +86,7 @@ static void virtio_input_handle_event(DeviceState *dev, QemuConsole *src,
                                       QemuInputEvent *evt)
 {
     VirtIOInput *vinput = VIRTIO_INPUT(dev);
+    VirtIOInputHID *vhid = VIRTIO_INPUT_HID(dev);
     virtio_input_event event;
 
     switch (evt->type) {
@@ -97,6 +100,19 @@ static void virtio_input_handle_event(DeviceState *dev, QemuConsole *src,
         if ((evt->btn.button == INPUT_BUTTON_WHEEL_UP ||
              evt->btn.button == INPUT_BUTTON_WHEEL_DOWN) &&
             evt->btn.down) {
+            virtio_input_config *rel = virtio_input_find_config(
+                vinput, VIRTIO_INPUT_CFG_EV_BITS, EV_REL);
+
+            /* Keep discrete wheels working after precise scrolling. */
+            if (rel && rel->size > REL_WHEEL_HI_RES / 8 &&
+                (rel->u.bitmap[REL_WHEEL_HI_RES / 8] &
+                 (1 << (REL_WHEEL_HI_RES % 8)))) {
+                event.type = cpu_to_le16(EV_REL);
+                event.code = cpu_to_le16(REL_WHEEL_HI_RES);
+                event.value = cpu_to_le32(
+                    evt->btn.button == INPUT_BUTTON_WHEEL_UP ? 120 : -120);
+                virtio_input_send(vinput, &event);
+            }
             event.type  = cpu_to_le16(EV_REL);
             event.code  = cpu_to_le16(REL_WHEEL);
             event.value = cpu_to_le32(evt->btn.button == INPUT_BUTTON_WHEEL_UP
@@ -116,6 +132,32 @@ static void virtio_input_handle_event(DeviceState *dev, QemuConsole *src,
         }
         break;
     case INPUT_EVENT_KIND_REL:
+        if (evt->rel.axis == INPUT_AXIS_WHEEL ||
+            evt->rel.axis == INPUT_AXIS_HWHEEL) {
+            int64_t *remainder = evt->rel.axis == INPUT_AXIS_WHEEL ?
+                                 &vhid->wheel_remainder :
+                                 &vhid->hwheel_remainder;
+            int legacy_code = evt->rel.axis == INPUT_AXIS_WHEEL ?
+                              REL_WHEEL : REL_HWHEEL;
+            int64_t total = *remainder + evt->rel.value;
+            int legacy_steps = total / 120;
+
+            event.type = cpu_to_le16(EV_REL);
+            event.code = cpu_to_le16(axismap_rel[evt->rel.axis]);
+            event.value = cpu_to_le32(evt->rel.value);
+            virtio_input_send(vinput, &event);
+
+            *remainder = total % 120;
+            if (legacy_steps) {
+                event.code = cpu_to_le16(legacy_code);
+                event.value = cpu_to_le32(legacy_steps);
+                virtio_input_send(vinput, &event);
+            }
+            break;
+        }
+        if (evt->rel.axis != INPUT_AXIS_X && evt->rel.axis != INPUT_AXIS_Y) {
+            break;
+        }
         event.type  = cpu_to_le16(EV_REL);
         event.code  = cpu_to_le16(axismap_rel[evt->rel.axis]);
         event.value = cpu_to_le32(evt->rel.value);
@@ -375,7 +417,8 @@ static const TypeInfo virtio_mouse_info = {
 
 static const QemuInputHandler virtio_tablet_handler = {
     .name  = VIRTIO_ID_NAME_TABLET,
-    .mask  = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_ABS,
+    .mask  = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_REL |
+             INPUT_EVENT_MASK_ABS,
     .event = virtio_input_handle_event,
     .sync  = virtio_input_handle_sync,
 };
@@ -406,8 +449,10 @@ static struct virtio_input_config virtio_tablet_config[] = {
         .subsel    = EV_REL,
         .size      = 2,
         .u.bitmap  = {
-            0,
-            (1 << (REL_WHEEL - 8))
+            (1 << REL_HWHEEL),
+            (1 << (REL_WHEEL - 8)) |
+            (1 << (REL_WHEEL_HI_RES - 8)) |
+            (1 << (REL_HWHEEL_HI_RES - 8))
         },
     },{
         .select    = VIRTIO_INPUT_CFG_ABS_INFO,
