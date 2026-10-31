@@ -29,6 +29,8 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
 #include <crt_externs.h>
+#include <IOKit/hidsystem/IOHIDLib.h>
+#include <IOKit/hidsystem/IOHIDParameter.h>
 #include <objc/runtime.h>
 #include <stdarg.h>
 
@@ -44,6 +46,7 @@
 #include "ui/kbd-state.h"
 #include "system/system.h"
 #include "system/runstate.h"
+#include "system/reset.h"
 #include "system/runstate-action.h"
 #include "system/cpu-throttle.h"
 #include "qapi/error.h"
@@ -355,6 +358,316 @@ static bool cocoa_host_keyboard_is_iso(void)
     return false;
 }
 
+/*
+ * On a Mac with a non-Latin input method, Caps Lock can switch input source:
+ * on Korean Macs it is the 한/영 key. The launcher sets TRYOMARCHY_CAPS_LOCK
+ * to hangul when Korean is the Mac's only such input method, and to
+ * input-method when there are others. None of this is documented by Apple; it
+ * follows what macOS was measured to do on a Korean Mac:
+ *
+ * - A short press switches the Mac input source. It reaches QEMU only through
+ *   the HID event tap, as a flagsChanged event with keyCode 0xff; AppKit drops
+ *   that event before -sendEvent:.
+ * - While the key is down, macOS locks Caps Lock provisionally and undoes it
+ *   for a short press, so every Caps Lock state seen during the press
+ *   flickers, including the IOHIDSystem lock state.
+ * - A long press locks capitals, confirmed by a 0xff event that is flagged
+ *   and locked, and moves the Mac to ABC; unlocking may move it back.
+ *
+ * So the guest's input method follows the Mac input source: at its change
+ * notification and at the next key after the VM window becomes key, the
+ * guest is told the Mac's side with an absolute key (Henkan to its input
+ * method, Muhenkan to direct input). In hangul mode it is told again before a
+ * space, return, tab, escape or arrow key every few seconds. Other input
+ * methods have their own keys to leave them for a moment, such as a lone Shift
+ * in Pinyin, and Henkan converts in Mozc, so they get no repeat. The guest's Caps Lock
+ * follows the IOHIDSystem lock state at key and modifier events, except while
+ * a Caps Lock press is undecided: from the kVK_CapsLock event until the lock
+ * state reads unlocked, a long press is confirmed, or
+ * COCOA_CAPS_LOCK_DECIDE_MS passes.
+ */
+typedef enum {
+    COCOA_CAPS_LOCK_MODE_OFF,
+    COCOA_CAPS_LOCK_MODE_INPUT_METHOD,
+    COCOA_CAPS_LOCK_MODE_HANGUL,
+} CocoaCapsLockMode;
+
+static int cocoa_caps_lock_mode_cached = -1;
+
+static CocoaCapsLockMode cocoa_caps_lock_mode(void)
+{
+    const char *mode;
+
+    if (cocoa_caps_lock_mode_cached < 0) {
+        mode = getenv("TRYOMARCHY_CAPS_LOCK");
+        cocoa_caps_lock_mode_cached =
+            mode == NULL ? COCOA_CAPS_LOCK_MODE_OFF :
+            strcmp(mode, "hangul") == 0 ? COCOA_CAPS_LOCK_MODE_HANGUL :
+            strcmp(mode, "input-method") == 0 ? COCOA_CAPS_LOCK_MODE_INPUT_METHOD :
+            COCOA_CAPS_LOCK_MODE_OFF;
+    }
+    return cocoa_caps_lock_mode_cached;
+}
+
+static bool cocoa_caps_lock_follows_input_source(void)
+{
+    return cocoa_caps_lock_mode() != COCOA_CAPS_LOCK_MODE_OFF;
+}
+
+static bool cocoa_caps_lock_locked(void)
+{
+    static bool opened;
+    static io_connect_t hid_system;
+    bool locked = false;
+
+    if (!opened) {
+        io_service_t service = IOServiceGetMatchingService(
+            kIOMainPortDefault, IOServiceMatching(kIOHIDSystemClass));
+
+        opened = true;
+        if (service) {
+            if (IOServiceOpen(service, mach_task_self(), kIOHIDParamConnectType,
+                              &hid_system) != KERN_SUCCESS) {
+                hid_system = 0;
+            }
+            IOObjectRelease(service);
+        }
+    }
+    if (hid_system &&
+        IOHIDGetModifierLockState(hid_system, kIOHIDCapsLockState, &locked) == KERN_SUCCESS) {
+        return locked;
+    }
+    return !!([NSEvent modifierFlags] & NSEventModifierFlagCapsLock);
+}
+
+typedef enum {
+    COCOA_CAPS_LOCK_NONE = 0,
+    COCOA_CAPS_LOCK_TOGGLE = 1,
+    COCOA_CAPS_LOCK_TO_INPUT_METHOD = 2,
+    COCOA_CAPS_LOCK_TO_DIRECT = 4,
+} CocoaCapsLockAction;
+
+typedef enum {
+    COCOA_CAPS_EVENT_OTHER,
+    COCOA_CAPS_EVENT_PRESS,
+    COCOA_CAPS_EVENT_CAPS_KEY,
+    COCOA_CAPS_EVENT_SWITCH,
+    COCOA_CAPS_EVENT_SYNC,
+} CocoaCapsLockEvent;
+
+#define COCOA_CAPS_LOCK_DECIDE_MS 1000
+#define COCOA_CAPS_LOCK_RESYNC_MS 2000
+
+typedef struct {
+    bool synced;
+    int64_t synced_ms;
+    bool pressed;
+    int64_t pressed_ms;
+} CocoaCapsLockState;
+
+/*
+ * Tells the guest which side the Mac input source is on, as an absolute key:
+ * Omarchy's Fcitx profile activates the input method on Henkan and
+ * deactivates it on Muhenkan, and the stock XKB maps both on every layout.
+ * A toggle could not be used: Fcitx keeps a state per window and a lone Shift
+ * also toggles it, so any count of the guest's state went wrong. Active is
+ * false while the VM window is not the key window of the active app; the
+ * guest is then told at the next key event.
+ */
+static int cocoa_caps_lock_input_source(CocoaCapsLockState *state, bool follow_mode,
+                                        bool active, bool input_method, int64_t now_ms)
+{
+    if (!follow_mode) {
+        return COCOA_CAPS_LOCK_NONE;
+    }
+    if (!active) {
+        state->synced = false;
+        return COCOA_CAPS_LOCK_NONE;
+    }
+    state->synced = true;
+    state->synced_ms = now_ms;
+    return input_method ? COCOA_CAPS_LOCK_TO_INPUT_METHOD : COCOA_CAPS_LOCK_TO_DIRECT;
+}
+
+/*
+ * The guest can miss a switch: before Fcitx runs at boot, or when focus moves
+ * to a window whose own state differs. Repeating the Mac's side at most every
+ * COCOA_CAPS_LOCK_RESYNC_MS heals that. A repeat goes only before a key that
+ * ends a Hangul syllable anyway (boundary), because Fcitx passes a redundant
+ * Henkan on to the engine, which would commit a syllable half typed.
+ */
+static bool cocoa_caps_lock_needs_input_source(const CocoaCapsLockState *state, int64_t now_ms,
+                                               bool boundary)
+{
+    return !state->synced ||
+           (boundary && now_ms - state->synced_ms >= COCOA_CAPS_LOCK_RESYNC_MS);
+}
+
+static int cocoa_caps_lock_action(CocoaCapsLockState *state,
+                                  bool follow_mode, CocoaCapsLockEvent kind,
+                                  bool event_caps, bool mac_caps,
+                                  bool input_method, bool boundary, int64_t now_ms,
+                                  bool guest_caps)
+{
+    int action = COCOA_CAPS_LOCK_NONE;
+
+    if (!follow_mode) {
+        return event_caps != guest_caps ? COCOA_CAPS_LOCK_TOGGLE : COCOA_CAPS_LOCK_NONE;
+    }
+    switch (kind) {
+    case COCOA_CAPS_EVENT_PRESS:
+        state->pressed = true;
+        state->pressed_ms = now_ms;
+        return COCOA_CAPS_LOCK_NONE;
+    case COCOA_CAPS_EVENT_SWITCH:
+        /* macOS confirms a long press with a 0xff event flagged and locked. */
+        if (event_caps && mac_caps) {
+            state->pressed = false;
+        }
+        return COCOA_CAPS_LOCK_NONE;
+    case COCOA_CAPS_EVENT_SYNC:
+        if (cocoa_caps_lock_needs_input_source(state, now_ms, boundary)) {
+            action |= cocoa_caps_lock_input_source(state, true, true, input_method, now_ms);
+        }
+        if (state->pressed) {
+            if (mac_caps && now_ms - state->pressed_ms < COCOA_CAPS_LOCK_DECIDE_MS) {
+                return action;
+            }
+            state->pressed = false;
+        }
+        if (mac_caps != guest_caps) {
+            action |= COCOA_CAPS_LOCK_TOGGLE;
+        }
+        return action;
+    default:
+        return COCOA_CAPS_LOCK_NONE;
+    }
+}
+
+static CocoaCapsLockState cocoa_caps_lock_state;
+
+static bool cocoa_caps_lock_key_event(NSEvent *event)
+{
+    return cocoa_caps_lock_follows_input_source() && [event type] == NSEventTypeFlagsChanged &&
+           ([event keyCode] == kVK_CapsLock || [event keyCode] == 0xff);
+}
+
+/*
+ * macOS decides that Globe was pressed alone, then reports the press that
+ * triggers its action, such as changing the input source, as key code 0xb3.
+ * It performs the action only if the event gets past the tap.
+ */
+static bool cocoa_globe_action_event(NSEvent *event)
+{
+    return cocoa_caps_lock_follows_input_source() &&
+           ([event type] == NSEventTypeKeyDown || [event type] == NSEventTypeKeyUp) &&
+           [event keyCode] == 0xb3;
+}
+
+/* A key before which hangul mode repeats the Mac's side. */
+static bool cocoa_caps_lock_boundary_key(NSEvent *event)
+{
+    if (cocoa_caps_lock_mode() != COCOA_CAPS_LOCK_MODE_HANGUL ||
+        [event type] != NSEventTypeKeyDown) {
+        return false;
+    }
+    switch ([event keyCode]) {
+    case kVK_Space:
+    case kVK_Return:
+    case kVK_ANSI_KeypadEnter:
+    case kVK_Tab:
+    case kVK_Escape:
+    case kVK_LeftArrow:
+    case kVK_RightArrow:
+    case kVK_UpArrow:
+    case kVK_DownArrow:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void cocoa_caps_lock_reset(void *opaque)
+{
+    memset(&cocoa_caps_lock_state, 0, sizeof(cocoa_caps_lock_state));
+}
+
+/*
+ * Korean, Chinese and Japanese input modes cannot type ASCII; ABC, the other
+ * keyboard layouts and the Japanese input method's own Roman mode can.
+ */
+static bool cocoa_input_source_is_input_method(void)
+{
+    bool input_method = false;
+    TISInputSourceRef source = TISCopyCurrentKeyboardInputSource();
+
+    if (source) {
+        CFStringRef type = TISGetInputSourceProperty(source, kTISPropertyInputSourceType);
+        CFBooleanRef ascii = TISGetInputSourceProperty(source, kTISPropertyInputSourceIsASCIICapable);
+
+        input_method = type && CFEqual(type, kTISTypeKeyboardInputMode) &&
+                       ascii && !CFBooleanGetValue(ascii);
+        CFRelease(source);
+    }
+    return input_method;
+}
+
+static int64_t cocoa_monotonic_ms(void)
+{
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+/*
+ * The guest's own Caps Lock state, from the keyboard light it reports
+ * (virtio-input EV_LED). QEMU's count of the Caps Lock presses it sent drifts
+ * from it as soon as anything else toggles the guest's Caps Lock, such as a
+ * QMP send-key, and the drift inverted capitals. Until the guest has reported
+ * its lights, and for a moment after a Caps Lock press while the guest's
+ * answer is on its way, the count is used.
+ */
+#define COCOA_CAPS_LOCK_LED_SETTLE_MS 300
+
+static bool cocoa_guest_leds_reported;
+static int64_t cocoa_caps_lock_sent_ms = INT64_MIN / 2;
+static int64_t cocoa_guest_leds_ms = INT64_MIN / 2;
+
+static void cocoa_guest_leds_changed(Notifier *notifier, void *data)
+{
+    cocoa_guest_leds_reported = true;
+    cocoa_guest_leds_ms = cocoa_monotonic_ms();
+}
+
+static Notifier cocoa_guest_leds_notifier = {
+    .notify = cocoa_guest_leds_changed,
+};
+
+static bool cocoa_guest_caps_lock(void)
+{
+    bool counted = qkbd_state_modifier_get(kbd, QKBD_MOD_CAPSLOCK);
+
+    if (!cocoa_guest_leds_reported ||
+        (cocoa_guest_leds_ms < cocoa_caps_lock_sent_ms &&
+         cocoa_monotonic_ms() - cocoa_caps_lock_sent_ms < COCOA_CAPS_LOCK_LED_SETTLE_MS)) {
+        return counted;
+    }
+    return !!(qemu_input_get_leds_mask(dcl.con) & QEMU_CAPS_LOCK_LED);
+}
+
+static void cocoa_caps_lock_send_input_source(int action)
+{
+    if (action & COCOA_CAPS_LOCK_TO_INPUT_METHOD) {
+        qkbd_state_key_event(kbd, KEY_HENKAN, true);
+        qkbd_state_key_event(kbd, KEY_HENKAN, false);
+    }
+    if (action & COCOA_CAPS_LOCK_TO_DIRECT) {
+        qkbd_state_key_event(kbd, KEY_MUHENKAN, true);
+        qkbd_state_key_event(kbd, KEY_MUHENKAN, false);
+    }
+}
+
 static int cocoa_keycode_to_linux(int keycode)
 {
     int linux_keycode;
@@ -486,6 +799,9 @@ static void handleAnyDeviceErrors(Error * err)
 - (void) notifyMouseModeChange;
 - (BOOL) isMouseGrabbed;
 - (BOOL) isKeyboardCaptured;
+- (BOOL) capsLockTapHandlesKeys;
+- (void) capsLockInputSourceChanged;
+- (void) capsLockWindowActivated;
 - (void) reenableEventTap;
 - (void) raiseAllKeys;
 - (void) endPinchLocked;
@@ -518,6 +834,21 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     NSEvent *event = [NSEvent eventWithCGEvent:cgEvent];
     if (getenv("TRYOMARCHY_INPUT_OBSERVE_ONLY")) {
         [view isKeyboardCaptured];
+        return cgEvent;
+    }
+    if (cocoa_globe_action_event(event)) {
+        return cgEvent;
+    }
+    if (cocoa_caps_lock_key_event(event)) {
+        /*
+         * macOS decides between switching the input source and locking
+         * capitals from these events after the tap: consuming them left
+         * Caps Lock unlocked on a long press. Handle them here and pass them
+         * on; -sendEvent: then gives AppKit's copy to AppKit unhandled.
+         */
+        if ([view isKeyboardCaptured]) {
+            [view handleEvent:event];
+        }
         return cgEvent;
     }
     if ([view isKeyboardCaptured] && [view handleEvent:event]) {
@@ -1530,6 +1861,33 @@ static NSSize cocoa_guest_frame_size(NSSize size, CGFloat scale)
     InputButton button;
     unsigned int keycode;
     NSUInteger modifiers = [event modifierFlags];
+    bool follow_mode = cocoa_caps_lock_follows_input_source();
+    NSEventType event_type = [event type];
+    bool flags_changed = event_type == NSEventTypeFlagsChanged;
+    CocoaCapsLockEvent caps_lock_event = COCOA_CAPS_EVENT_OTHER;
+
+    if (flags_changed && [event keyCode] == 0xff) {
+        caps_lock_event = COCOA_CAPS_EVENT_SWITCH;
+    } else if (flags_changed && [event keyCode] == kVK_CapsLock) {
+        caps_lock_event = COCOA_CAPS_EVENT_PRESS;
+    } else if (event_type == NSEventTypeSystemDefined) {
+        caps_lock_event = COCOA_CAPS_EVENT_CAPS_KEY;
+    } else if (flags_changed || event_type == NSEventTypeKeyDown ||
+               event_type == NSEventTypeKeyUp) {
+        caps_lock_event = COCOA_CAPS_EVENT_SYNC;
+    }
+    int caps_lock_action = cocoa_caps_lock_action(
+        &cocoa_caps_lock_state, follow_mode, caps_lock_event,
+        !!(modifiers & NSEventModifierFlagCapsLock),
+        follow_mode && (caps_lock_event == COCOA_CAPS_EVENT_SYNC ||
+                        caps_lock_event == COCOA_CAPS_EVENT_SWITCH) && cocoa_caps_lock_locked(),
+        follow_mode && caps_lock_event == COCOA_CAPS_EVENT_SYNC &&
+            cocoa_caps_lock_needs_input_source(&cocoa_caps_lock_state, cocoa_monotonic_ms(),
+                                               cocoa_caps_lock_boundary_key(event)) &&
+            cocoa_input_source_is_input_method(),
+        follow_mode && cocoa_caps_lock_boundary_key(event),
+        follow_mode ? cocoa_monotonic_ms() : 0,
+        follow_mode ? cocoa_guest_caps_lock() : qkbd_state_modifier_get(kbd, QKBD_MOD_CAPSLOCK));
 
     /*
      * Check -[NSEvent modifierFlags] here.
@@ -1568,10 +1926,13 @@ static NSSize cocoa_guest_frame_size(NSSize size, CGFloat scale)
      *   completely leaving your hands from the keyboard, which hopefully makes
      *   this implementation usable enough.
      */
-    if (!!(modifiers & NSEventModifierFlagCapsLock) !=
-        qkbd_state_modifier_get(kbd, QKBD_MOD_CAPSLOCK)) {
+    cocoa_caps_lock_send_input_source(caps_lock_action);
+    if (caps_lock_action & COCOA_CAPS_LOCK_TOGGLE) {
         qkbd_state_key_event(kbd, KEY_CAPSLOCK, true);
         qkbd_state_key_event(kbd, KEY_CAPSLOCK, false);
+        if (follow_mode) {
+            cocoa_caps_lock_sent_ms = cocoa_monotonic_ms();
+        }
     }
 
     if (!(modifiers & NSEventModifierFlagShift)) {
@@ -1989,6 +2350,35 @@ static NSSize cocoa_guest_frame_size(NSSize size, CGFloat scale)
         }
     }
     return captured;
+}
+
+/* The full-grab tap handles Caps Lock key events while it captures the keyboard. */
+- (BOOL) capsLockTapHandlesKeys
+{
+    return eventsTap && CGEventTapIsEnabled(eventsTap) && [self isKeyboardCaptured];
+}
+
+/* The Mac input source changed: bring the guest's input method along. */
+- (void) capsLockInputSourceChanged
+{
+    bool input_method = cocoa_input_source_is_input_method();
+    bool active = [NSApp isActive] && [[self window] isKeyWindow];
+
+    with_bql(^{
+        int sent = cocoa_caps_lock_input_source(&cocoa_caps_lock_state,
+                                                cocoa_caps_lock_follows_input_source(),
+                                                active, input_method, cocoa_monotonic_ms());
+
+        cocoa_caps_lock_send_input_source(sent);
+    });
+}
+
+/* Another app may have changed the input source: check at the next key. */
+- (void) capsLockWindowActivated
+{
+    with_bql(^{
+        cocoa_caps_lock_state.synced = false;
+    });
 }
 
 /* macOS can disable a slow tap; restore capture after either notification. */
@@ -2572,6 +2962,17 @@ static NSRect cocoa_initial_window_frame(void)
 - (void)sendEvent:(NSEvent *)event
 {
     COCOA_DEBUG("QemuApplication: sendEvent\n");
+    if (cocoa_caps_lock_key_event(event)) {
+        /*
+         * AppKit takes part in locking capitals from these events, so they
+         * always reach it. QEMU handles them here only when the tap did not.
+         */
+        if (![cocoaView capsLockTapHandlesKeys]) {
+            [cocoaView handleEvent:event];
+        }
+        [super sendEvent:event];
+        return;
+    }
     if (![cocoaView handleEvent:event]) {
         [super sendEvent: event];
     }
@@ -3451,6 +3852,24 @@ static void cocoa_display_init(DisplayState *ds, DisplayOptions *opts)
     qemu_add_mouse_mode_change_notifier(&mouse_mode_change_notifier);
     [cocoaView notifyMouseModeChange];
     [cocoaView updateUIInfo];
+    qemu_register_reset(cocoa_caps_lock_reset, NULL);
+    if (cocoa_caps_lock_follows_input_source()) {
+        qemu_input_led_notifier_add(&cocoa_guest_leds_notifier);
+        [[NSDistributedNotificationCenter defaultCenter]
+            addObserverForName:(NSString *)kTISNotifySelectedKeyboardInputSourceChanged
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) {
+            [cocoaView capsLockInputSourceChanged];
+        }];
+        [[NSNotificationCenter defaultCenter]
+            addObserverForName:NSWindowDidBecomeKeyNotification
+                        object:[cocoaView window]
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) {
+            [cocoaView capsLockWindowActivated];
+        }];
+    }
     pinch_vm_change = qemu_add_vm_change_state_handler(cocoa_pinch_vm_change,
                                                        NULL);
 
