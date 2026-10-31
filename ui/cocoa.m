@@ -288,6 +288,13 @@ static bool bool_with_bql(BoolCodeBlock block)
     return val;
 }
 
+static NSString *cocoa_product_name(void)
+{
+    NSString *name = qemu_name ? [NSString stringWithUTF8String:qemu_name] : nil;
+
+    return [name length] ? name : @"Try Omarchy";
+}
+
 static int cocoa_keycode_to_linux(int keycode)
 {
     if (qemu_input_map_osx_to_linux_len <= keycode) {
@@ -1214,10 +1221,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 {
     COCOA_DEBUG("QemuCocoaView: grabMouse\n");
 
-    if (qemu_name)
-        [[self window] setTitle:[NSString stringWithFormat:@"QEMU %s - (Press  " UC_CTRL_KEY " " UC_ALT_KEY " G  to release Mouse)", qemu_name]];
-    else
-        [[self window] setTitle:@"QEMU - (Press  " UC_CTRL_KEY " " UC_ALT_KEY " G  to release Mouse)"];
+    [[self window] setTitle:[NSString stringWithFormat:@"%@ - (Press  " UC_CTRL_KEY " " UC_ALT_KEY " G  to release Mouse)", cocoa_product_name()]];
     [self hideCursor];
     CGAssociateMouseAndMouseCursorPosition(isAbsoluteEnabled);
     isMouseGrabbed = TRUE; // while isMouseGrabbed = TRUE, QemuCocoaApp sends all events to [cocoaView handleEvent:]
@@ -1227,10 +1231,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 {
     COCOA_DEBUG("QemuCocoaView: ungrabMouse\n");
 
-    if (qemu_name)
-        [[self window] setTitle:[NSString stringWithFormat:@"QEMU %s", qemu_name]];
-    else
-        [[self window] setTitle:@"QEMU"];
+    [[self window] setTitle:cocoa_product_name()];
     [self unhideCursor];
     CGAssociateMouseAndMouseCursorPosition(TRUE);
     isMouseGrabbed = FALSE;
@@ -1345,7 +1346,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         }
         [window setAcceptsMouseMovedEvents:YES];
         [window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
-        [window setTitle:qemu_name ? [NSString stringWithFormat:@"QEMU %s", qemu_name] : @"QEMU"];
+        [window setTitle:cocoa_product_name()];
         [window setContentView:cocoaView];
         [window makeKeyAndOrderFront:self];
         [window center];
@@ -1667,7 +1668,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 {
     NSAlert *alert = [NSAlert new];
     [alert autorelease];
-    [alert setMessageText: @"Are you sure you want to quit QEMU?"];
+    [alert setMessageText: [NSString stringWithFormat:@"Are you sure you want to quit %@?", cocoa_product_name()]];
     [alert addButtonWithTitle: @"Cancel"];
     [alert addButtonWithTitle: @"Quit"];
     if([alert runModal] == NSAlertSecondButtonReturn) {
@@ -1681,20 +1682,16 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 - (IBAction) do_about_menu_item: (id) sender
 {
     NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-    char *icon_path_c = get_relocated_path(CONFIG_QEMU_ICONDIR "/hicolor/512x512/apps/qemu.png");
-    NSString *icon_path = [NSString stringWithUTF8String:icon_path_c];
-    g_free(icon_path_c);
-    NSImage *icon = [[NSImage alloc] initWithContentsOfFile:icon_path];
     NSString *version = @"QEMU emulator version " QEMU_FULL_VERSION;
     NSString *copyright = @QEMU_COPYRIGHT;
-    NSDictionary *options;
+    NSImage *icon = [NSApp applicationIconImage];
+    NSDictionary *options = nil;
     if (icon) {
         options = @{
             NSAboutPanelOptionApplicationIcon : icon,
             NSAboutPanelOptionApplicationVersion : version,
             @"Copyright" : copyright,
         };
-        [icon release];
     } else {
         options = @{
             NSAboutPanelOptionApplicationVersion : version,
@@ -1761,17 +1758,17 @@ static void create_initial_menus(void)
 
     // Application menu
     menu = [[NSMenu alloc] initWithTitle:@""];
-    [menu addItemWithTitle:@"About QEMU" action:@selector(do_about_menu_item:) keyEquivalent:@""]; // About QEMU
+    [menu addItemWithTitle:[@"About " stringByAppendingString:cocoa_product_name()] action:@selector(do_about_menu_item:) keyEquivalent:@""];
     [menu addItem:[NSMenuItem separatorItem]]; //Separator
     menuItem = [menu addItemWithTitle:@"Services" action:nil keyEquivalent:@""];
     [menuItem setSubmenu:[NSApp servicesMenu]];
     [menu addItem:[NSMenuItem separatorItem]];
-    [menu addItemWithTitle:@"Hide QEMU" action:@selector(hide:) keyEquivalent:@"h"]; //Hide QEMU
+    [menu addItemWithTitle:[@"Hide " stringByAppendingString:cocoa_product_name()] action:@selector(hide:) keyEquivalent:@"h"];
     menuItem = (NSMenuItem *)[menu addItemWithTitle:@"Hide Others" action:@selector(hideOtherApplications:) keyEquivalent:@"h"]; // Hide Others
     [menuItem setKeyEquivalentModifierMask:(NSEventModifierFlagOption|NSEventModifierFlagCommand)];
     [menu addItemWithTitle:@"Show All" action:@selector(unhideAllApplications:) keyEquivalent:@""]; // Show All
     [menu addItem:[NSMenuItem separatorItem]]; //Separator
-    [menu addItemWithTitle:@"Quit QEMU" action:@selector(terminate:) keyEquivalent:@"q"];
+    [menu addItemWithTitle:[@"Quit " stringByAppendingString:cocoa_product_name()] action:@selector(terminate:) keyEquivalent:@"q"];
     menuItem = [[NSMenuItem alloc] initWithTitle:@"Apple" action:nil keyEquivalent:@""];
     [menuItem setSubmenu:menu];
     [[NSApp mainMenu] addItem:menuItem];
@@ -2433,6 +2430,38 @@ static void cocoa_display_early_init(DisplayOptions *o)
     }
 }
 
+static void cocoa_set_product_icon(void)
+{
+    const char *configured = getenv("TRYOMARCHY_PRODUCT_ICON");
+    NSString *iconPath = nil;
+
+    if (configured && configured[0] == '/') {
+        iconPath = [NSString stringWithUTF8String:configured];
+    } else {
+        NSArray *arguments = [[NSProcessInfo processInfo] arguments];
+
+        if ([arguments count] == 0) {
+            return;
+        }
+
+        NSString *executablePath =
+            [[arguments objectAtIndex:0] stringByResolvingSymlinksInPath];
+        NSString *resourcesPath =
+            [[[executablePath stringByDeletingLastPathComponent]
+              stringByDeletingLastPathComponent]
+             stringByDeletingLastPathComponent];
+        iconPath =
+            [resourcesPath stringByAppendingPathComponent:@"TryOmarchy.icns"];
+    }
+
+    NSImage *icon = iconPath ? [[NSImage alloc] initWithContentsOfFile:iconPath] : nil;
+
+    if (icon) {
+        [NSApp setApplicationIconImage:icon];
+        [icon release];
+    }
+}
+
 static void cocoa_display_init(DisplayState *ds, DisplayOptions *opts)
 {
     NSAutoreleasePool * pool = [[NSAutoreleasePool alloc] init];
@@ -2445,7 +2474,9 @@ static void cocoa_display_init(DisplayState *ds, DisplayOptions *opts)
     ProcessSerialNumber psn = { 0, kCurrentProcess };
     TransformProcessType(&psn, kProcessTransformToForegroundApplication);
 
+    [[NSProcessInfo processInfo] setProcessName:cocoa_product_name()];
     [QemuApplication sharedApplication];
+    cocoa_set_product_icon();
 
     dcl.con = qemu_console_lookup_default();
     kbd = qkbd_state_init(dcl.con);
