@@ -40,6 +40,7 @@
 #endif
 
 #ifdef __APPLE__
+#include <Availability.h>
 #include <mach-o/dyld.h>
 #endif
 
@@ -755,6 +756,14 @@ int qemu_strtod_finite(const char *nptr, const char **endptr, double *result)
     return ret;
 }
 
+#if defined(__APPLE__) && defined(__MAC_15_4) && \
+    defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && \
+    __MAC_OS_X_VERSION_MAX_ALLOWED >= __MAC_15_4
+extern char *qemu_darwin_strchrnul(const char *, int)
+    __asm("_strchrnul") __attribute__((weak_import));
+#define QEMU_DARWIN_WEAK_STRCHRNUL 1
+#endif
+
 /**
  * Searches for the first occurrence of 'c' in 's', and returns a pointer
  * to the trailing null byte if none was found.
@@ -762,7 +771,14 @@ int qemu_strtod_finite(const char *nptr, const char **endptr, double *result)
 #ifndef HAVE_STRCHRNUL
 const char *qemu_strchrnul(const char *s, int c)
 {
-    const char *e = strchr(s, c);
+    const char *e;
+
+#ifdef QEMU_DARWIN_WEAK_STRCHRNUL
+    if (qemu_darwin_strchrnul != NULL) {
+        return qemu_darwin_strchrnul(s, c);
+    }
+#endif
+    e = strchr(s, c);
     if (!e) {
         e = s + strlen(s);
     }
