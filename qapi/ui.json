@@ -1437,6 +1437,10 @@
 #     grab on key events.  (default: off)  See
 #     https://support.apple.com/en-in/guide/mac-help/mh32356/mac
 #
+# @immersive: Hide the host menu bar and Dock instead of using
+#     AppKit's standard fullscreen auto-hide behavior.  This does not
+#     affect keyboard capture.  (default: on)
+#
 # @swap-opt-cmd: Swap the Option and Command keys so that their key
 #     codes match their position on non-Mac keyboards and you can use
 #     Meta/Super and Alt where you expect them.  (default: off)
@@ -1454,6 +1458,7 @@
   'data': {
       '*left-command-key': 'bool',
       '*full-grab': 'bool',
+      '*immersive': 'bool',
       '*swap-opt-cmd': 'bool',
       '*zoom-to-fit': 'bool',
       '*zoom-interpolation': 'bool'

@@ -2258,7 +2258,7 @@ DEF("display", HAS_ARG, QEMU_OPTION_display,
     "-display curses[,charset=<encoding>]\n"
 #endif
 #if defined(CONFIG_COCOA)
-    "-display cocoa[,full-grab=on|off][,swap-opt-cmd=on|off]\n"
+    "-display cocoa[,full-grab=on|off][,immersive=on|off][,swap-opt-cmd=on|off]\n"
     "              [,show-cursor=on|off][,left-command-key=on|off]\n"
     "              [,full-screen=on|off][,zoom-to-fit=on|off]\n"
 #endif
