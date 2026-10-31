@@ -2468,8 +2468,36 @@ static void cocoa_clipboard_request(QemuClipboardInfo *info,
     }
 }
 
+/*
+ * macOS naps an app none of whose windows can be seen (the screen locked, the
+ * VM's full screen on another Space, the window minimized or covered). Every
+ * QEMU thread, the vCPUs too, then runs at background priority, and the guest
+ * slows to a fraction of its speed. Hold an activity for the whole run so the
+ * VM keeps working while nobody looks at it; idle system sleep stays allowed,
+ * and the app pauses the VM itself for Mac sleep. TRYOMARCHY_APP_NAP=1 lets
+ * macOS nap it, for measurements.
+ */
+static void cocoa_hold_no_app_nap_activity(void)
+{
+    static id activity;
+    const char *allow = getenv("TRYOMARCHY_APP_NAP");
+
+    if (activity) {
+        return;
+    }
+    if (allow && strcmp(allow, "1") == 0) {
+        info_report("Try Omarchy: App Nap allowed (TRYOMARCHY_APP_NAP=1)");
+        return;
+    }
+    activity = [[[NSProcessInfo processInfo]
+        beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep
+                          reason:@"Omarchy is running"] retain];
+    info_report("Try Omarchy: App Nap off while the VM runs");
+}
+
 static int cocoa_main(void)
 {
+    cocoa_hold_no_app_nap_activity();
     COCOA_DEBUG("Main thread: entering OSX run loop\n");
     [NSApp run];
     COCOA_DEBUG("Main thread: left OSX run loop, which should never happen\n");
