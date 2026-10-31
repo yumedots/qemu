@@ -22,6 +22,7 @@ hda_audio_running(const char *stream, int nr, bool running) "st %s, nr %d, run %
 hda_audio_format(const char *stream, int chan, const char *fmt, int freq) "st %s, %d x %s @ %d Hz"
 hda_audio_adjust(const char *stream, int pos) "st %s, pos %d"
 hda_audio_overrun(const char *stream) "st %s"
+hda_audio_full_recovery(const char *stream, int64_t virtual_ns, int64_t queued, int avail) "st %s virtual_ns %" PRId64 " queued %" PRId64 " avail %d"
 
 # pcspk.c
 pcspk_io_read(uint16_t addr, uint8_t val) "[0x%"PRIx16"] -> 0x%"PRIx8

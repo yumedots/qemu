@@ -343,12 +343,12 @@ static void hda_audio_output_cb(void *opaque, int avail)
     int64_t to_transfer = MIN(wpos - rpos, avail);
 
     if (wpos - rpos == B_SIZE) {
-        /* drop buffer, reset timer adjust */
-        st->rpos = 0;
-        st->wpos = 0;
-        st->buft_start = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-        trace_hda_audio_overrun(st->node->name);
-        return;
+        /* Preserve queued samples, but discard elapsed-time catch-up debt. */
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        st->buft_start = now - muldiv64(wpos, NANOSECONDS_PER_SECOND,
+                                       hda_bytes_per_second(st));
+        trace_hda_audio_full_recovery(st->node->name, now, wpos - rpos,
+                                      avail);
     }
 
     while (to_transfer) {
