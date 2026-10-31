@@ -20,3 +20,5 @@ GTAGS
 *.swp
 *.patch
 *.gcov
+/.gpuRuntime
+/qemu-gpu-runtime.arm64.tgz
