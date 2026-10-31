@@ -14,6 +14,7 @@
 #define HVF_H
 
 #include "qemu/accel.h"
+#include "exec/hwaddr.h"
 
 #ifdef COMPILING_PER_TARGET
 # ifdef CONFIG_HVF
@@ -37,6 +38,9 @@ extern bool hvf_nested_virt;
 #endif /* !CONFIG_HVF_IS_POSSIBLE */
 
 void hvf_nested_virt_enable(bool nested_virt);
+
+/* Discard a free-page report in the system address space, under the BQL. */
+void hvf_report_free_pages(hwaddr gpa, void *host, size_t size);
 
 #define TYPE_HVF_ACCEL ACCEL_CLASS_NAME("hvf")
 

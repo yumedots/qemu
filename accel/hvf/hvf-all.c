@@ -16,6 +16,8 @@
 #include "exec/cpu-common.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
+#include "system/ramblock.h"
+#include "qemu/main-loop.h"
 #include "system/hvf.h"
 #include "system/hvf_int.h"
 #include "hw/core/cpu.h"
@@ -133,6 +135,66 @@ static void hvf_set_phys_mem(MemoryRegionSection *section, bool add)
                      flags & HV_MEMORY_EXEC ?  'X' : '-');
     ret = hv_vm_map(mem, gpa, size, flags);
     assert_hvf_ok(ret);
+}
+
+void hvf_report_free_pages(hwaddr gpa, void *host, size_t size)
+{
+    MemoryRegionSection section;
+    MemoryRegion *mr;
+    RAMBlock *rb;
+    size_t page_size = qemu_real_host_page_size();
+    hv_memory_flags_t flags = HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC;
+    void *replacement;
+
+    assert(bql_locked());
+    if (!size || !QEMU_IS_ALIGNED(gpa | (uintptr_t)host | size, page_size)) {
+        return;
+    }
+
+    /* Only replace QEMU-owned private anonymous RAM, mapped at this GPA.
+     * Never replace shared, file-backed, device, ROM, or externally owned RAM.
+     * Skip dirty logging rather than bypassing HVF's write protection.
+     */
+    section = memory_region_find(get_system_memory(), gpa, size);
+    mr = section.mr;
+    if (!mr) {
+        return;
+    }
+    rb = mr->ram_block;
+    if (!memory_region_is_ram(mr) || mr->readonly || mr->rom_device ||
+        memory_region_is_ram_device(mr) || !rb || rb->fd >= 0 ||
+        (rb->flags & (RAM_SHARED | RAM_PREALLOC)) ||
+        memory_region_get_dirty_log_mask(mr) ||
+        int128_get64(section.size) != size ||
+        section.offset_within_address_space != gpa ||
+        memory_region_get_ram_ptr(mr) + section.offset_within_region != host) {
+        memory_region_unref(mr);
+        return;
+    }
+
+    /* Darwin MADV_DONTNEED does not discard guest-dirtied RAM. First remove
+     * the stage-2 mapping, then replace its host backing with fresh demand-zero
+     * pages at the same address. MAP_FIXED avoids any unreserved-address gap.
+     * Unlike MADV_FREE_REUSABLE, this uses public APIs and leaves no reusable
+     * accounting state on pages that the guest subsequently allocates again.
+     * The guest owns none of these pages until we acknowledge its report.
+     */
+    trace_hvf_vm_unmap(gpa, size);
+    assert_hvf_ok(hv_vm_unmap(gpa, size));
+    replacement = mmap(host, size, PROT_READ | PROT_WRITE,
+                       MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (replacement == MAP_FAILED) {
+        error_report("HVF free-page backing replacement failed: %s",
+                     strerror(errno));
+        abort();
+    }
+    assert(replacement == host);
+    trace_hvf_vm_map(gpa, size, host, flags,
+                     flags & HV_MEMORY_READ ? 'R' : '-',
+                     flags & HV_MEMORY_WRITE ? 'W' : '-',
+                     flags & HV_MEMORY_EXEC ? 'X' : '-');
+    assert_hvf_ok(hv_vm_map(host, gpa, size, flags));
+    memory_region_unref(mr);
 }
 
 static void hvf_log_start(MemoryListener *listener,

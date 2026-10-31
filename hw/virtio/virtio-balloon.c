@@ -23,6 +23,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/boards.h"
 #include "system/balloon.h"
+#include "system/hvf.h"
 #include "system/ramblock.h"
 #include "hw/virtio/virtio-balloon.h"
 #include "system/address-spaces.h"
@@ -389,7 +390,14 @@ static void virtio_balloon_handle_report(VirtIODevice *vdev, VirtQueue *vq)
                 continue;
             }
 
-            ram_block_discard_range(rb, ram_offset, size);
+            if (hvf_enabled()) {
+                /* in_addr is a GPA only without an intervening IOMMU. */
+                if (vdev->dma_as == &address_space_memory) {
+                    hvf_report_free_pages(elem->in_addr[i], addr, size);
+                }
+            } else {
+                ram_block_discard_range(rb, ram_offset, size);
+            }
         }
 
 skip_element:

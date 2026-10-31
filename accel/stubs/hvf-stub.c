@@ -9,6 +9,11 @@
 #include "qemu/osdep.h"
 #include "system/hvf.h"
 
+void hvf_report_free_pages(hwaddr gpa, void *host, size_t size)
+{
+    g_assert_not_reached();
+}
+
 bool hvf_allowed;
 bool hvf_kernel_irqchip;
 bool hvf_nested_virt;
