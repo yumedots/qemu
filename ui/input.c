@@ -421,6 +421,12 @@ void qemu_input_event_send_key_number(QemuConsole *src, int num, bool down)
     qemu_input_event_send_key_linux(src, lnx, down);
 }
 
+/* Called under the BQL before enqueueing a complete text batch. */
+bool qemu_input_event_queue_has_room(size_t count)
+{
+    return queue_count <= queue_limit && count <= queue_limit - queue_count;
+}
+
 void qemu_input_event_send_key_delay(uint32_t delay_ms)
 {
     if (!runstate_is_running() && !runstate_check(RUN_STATE_SUSPENDED)) {

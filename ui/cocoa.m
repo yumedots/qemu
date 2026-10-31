@@ -107,6 +107,7 @@ static const DisplayChangeListenerOps dcl_ops = {
 static DisplayChangeListener dcl;
 static DisplaySurface *surface;
 static QKbdState *kbd;
+static int64_t injectedTextSource;
 static int cursor_hide = 1;
 static int left_command_key_enabled = 1;
 static bool swap_opt_cmd;
@@ -343,6 +344,48 @@ static int cocoa_keycode_to_linux(int keycode)
         }
     }
     return linux_keycode;
+}
+
+/* Text injection carries a placeholder A keycode, not a physical key. */
+static UniChar cocoa_layout_character(const UCKeyboardLayout *layout,
+                                     UInt16 keycode, UInt32 modifiers,
+                                     bool direct_only)
+{
+    UInt32 dead = 0;
+    UniChar chars[4];
+    UniCharCount count = 0;
+    OSStatus status = UCKeyTranslate(layout, keycode, kUCKeyActionDown,
+                                    modifiers, LMGetKbdType(),
+                                    direct_only ? 0 : kUCKeyTranslateNoDeadKeysMask,
+                                    &dead,
+                                    ARRAY_SIZE(chars), &count, chars);
+    return status == noErr && count == 1 && !dead ? chars[0] : 0;
+}
+
+/* Only direct, printable ASCII is supported; this is not a guest IME. */
+static bool cocoa_text_key(const UCKeyboardLayout *layout, UniChar ch,
+                           UInt32 caps, UInt16 *keycode, bool *shift)
+{
+    if (ch < 0x20 || ch > 0x7e) {
+        return false;
+    }
+    for (unsigned int shifted = 0; shifted < 2; shifted++) {
+        for (UInt16 key = 0; key < 0x80; key++) {
+            /* Exclude keypad keys: their meaning depends on guest Num Lock. */
+            if (key > kVK_ANSI_Grave && key != kVK_JIS_Yen &&
+                key != kVK_JIS_Underscore) {
+                continue;
+            }
+            UInt32 mods = shifted ? (shiftKey >> 8) : 0;
+            if (cocoa_layout_character(layout, key, mods, true) == ch) {
+                *keycode = key;
+                *shift = shifted ^ (caps && ((ch >= 'a' && ch <= 'z') ||
+                                             (ch >= 'A' && ch <= 'Z')));
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 /* Displays an alert dialog box with the specified message */
@@ -1029,6 +1072,103 @@ static void cocoa_pinch_send_frame(void *opaque, const CocoaPinchFrame *frame)
     });
 }
 
+- (bool) handleInjectedText:(NSEvent *)event
+{
+    if ([event type] != NSEventTypeKeyDown && [event type] != NSEventTypeKeyUp) {
+        return false;
+    }
+    CGEventRef cgEvent = [event CGEvent];
+    int64_t source = cgEvent ? CGEventGetIntegerValueField(
+        cgEvent, kCGEventSourceUnixProcessID) : 0;
+    if ([event keyCode] != kVK_ANSI_A || !source) {
+        return false;
+    }
+    if ([event type] == NSEventTypeKeyUp) {
+        if (injectedTextSource == source) {
+            injectedTextSource = 0;
+            return true;
+        }
+        return false;
+    }
+    if (injectedTextSource == source) {
+        injectedTextSource = 0;
+    }
+    NSString *text = [event characters];
+    if (![text length]) {
+        return false;
+    }
+    TISInputSourceRef input = TISCopyCurrentKeyboardLayoutInputSource();
+    CFDataRef data = input ? TISGetInputSourceProperty(
+        input, kTISPropertyUnicodeKeyLayoutData) : NULL;
+    const UCKeyboardLayout *layout = data ?
+        (const UCKeyboardLayout *)CFDataGetBytePtr(data) : NULL;
+    UInt32 caps = ([event modifierFlags] & NSEventModifierFlagCapsLock) ?
+        (alphaLock >> 8) : 0;
+    UInt32 mods = caps | (([event modifierFlags] & NSEventModifierFlagShift) ?
+                         (shiftKey >> 8) : 0);
+    if ([event modifierFlags] & NSEventModifierFlagOption) {
+        mods |= optionKey >> 8;
+    }
+    if ([event modifierFlags] & NSEventModifierFlagControl) {
+        mods |= controlKey >> 8;
+    }
+    if ([event modifierFlags] & NSEventModifierFlagCommand) {
+        mods |= cmdKey >> 8;
+    }
+    /* Keep real A-key input, including non-US layouts, on the physical path. */
+    bool physical = layout && [text length] == 1 &&
+        [text characterAtIndex:0] ==
+        cocoa_layout_character(layout, kVK_ANSI_A, mods, false);
+    bool shortcut = [event modifierFlags] & (NSEventModifierFlagCommand |
+                                             NSEventModifierFlagControl |
+                                             NSEventModifierFlagOption);
+    bool shift = [event modifierFlags] & NSEventModifierFlagShift;
+    bool guest_shift = qkbd_state_key_get(kbd, KEY_LEFTSHIFT) ||
+                       qkbd_state_key_get(kbd, KEY_RIGHTSHIFT);
+    if (!layout || (physical && (shortcut || shift == guest_shift))) {
+        if (input) {
+            CFRelease(input);
+        }
+        return false;
+    }
+    injectedTextSource = source;
+    /* Shortcuts are physical only when their text matches the layout. */
+    if (shortcut) {
+        CFRelease(input);
+        return true;
+    }
+    /* Validate the whole batch before emitting any keys (including passwords). */
+    UInt16 keys[128];
+    bool shifts[128];
+    bool valid = [text length] <= ARRAY_SIZE(keys) &&
+        qemu_input_event_queue_has_room(9 * [text length] + 4);
+    for (NSUInteger i = 0; valid && i < [text length]; i++) {
+        valid = cocoa_text_key(layout, [text characterAtIndex:i], caps,
+                               &keys[i], &shifts[i]);
+        if (valid) {
+            valid = !qkbd_state_key_get(kbd, cocoa_keycode_to_linux(keys[i]));
+        }
+    }
+    CFRelease(input);
+    if (!valid) {
+        return true;
+    }
+    bool left = qkbd_state_key_get(kbd, KEY_LEFTSHIFT);
+    bool right = qkbd_state_key_get(kbd, KEY_RIGHTSHIFT);
+    for (NSUInteger i = 0; i < [text length]; i++) {
+        qkbd_state_key_event(kbd, KEY_RIGHTSHIFT, false);
+        qkbd_state_key_event(kbd, KEY_LEFTSHIFT, shifts[i]);
+        int key = cocoa_keycode_to_linux(keys[i]);
+        qkbd_state_key_event(kbd, key, true);
+        qkbd_state_key_event(kbd, key, false);
+        /* Let the guest refill its 64-entry virtio keyboard ring. */
+        qemu_input_event_send_key_delay(10);
+    }
+    qkbd_state_key_event(kbd, KEY_LEFTSHIFT, left);
+    qkbd_state_key_event(kbd, KEY_RIGHTSHIFT, right);
+    return true;
+}
+
 - (bool) handleEventLocked:(NSEvent *)event
 {
     /* Return true if we handled the event, false if it should be given to OSX */
@@ -1105,6 +1245,10 @@ static void cocoa_pinch_send_frame(void *opaque, const CocoaPinchFrame *frame)
             qkbd_state_key_event(kbd, KEY_LEFTMETA, false);
             qkbd_state_key_event(kbd, KEY_RIGHTMETA, false);
         }
+    }
+
+    if (qemu_console_is_graphic(dcl.con) && [self handleInjectedText:event]) {
+        return true;
     }
 
     switch ([event type]) {
@@ -1492,6 +1636,7 @@ static void cocoa_pinch_send_frame(void *opaque, const CocoaPinchFrame *frame)
 {
     with_bql(^{
         [self endPinchLocked];
+        injectedTextSource = 0;
         qkbd_state_lift_all_keys(kbd);
     });
 }
