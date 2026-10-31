@@ -57,6 +57,11 @@ typedef struct SDLVoiceOut {
     int initialized;
     Audiodev *dev;
     SDL_AudioDeviceID devid;
+    SDL_AudioSpec reopen_spec;
+    char *device_name;
+    gint64 next_route_check;
+    bool route_matches;
+    bool enabled;
 } SDLVoiceOut;
 
 typedef struct SDLVoiceIn {
@@ -65,6 +70,11 @@ typedef struct SDLVoiceIn {
     int initialized;
     Audiodev *dev;
     SDL_AudioDeviceID devid;
+    SDL_AudioSpec reopen_spec;
+    char *device_name;
+    gint64 next_route_check;
+    bool route_matches;
+    bool enabled;
 } SDLVoiceIn;
 
 static int aud_to_sdlfmt (AudioFormat fmt)
@@ -157,8 +167,73 @@ static int sdl_to_audfmt(int sdlfmt, AudioFormat *fmt, bool *big_endian)
     return 0;
 }
 
+/*
+ * The launcher gives QEMU an initial direction-aware route through the
+ * environment. A private, atomically replaced control file then lets the
+ * guest-facing bridge change that route without restarting the VM.
+ */
+static char *sdl_initial_device_name(int rec)
+{
+    const char *name = g_getenv(rec ? "OMARCHY_SDL_INPUT_DEVICE_NAME" :
+                                     "OMARCHY_SDL_OUTPUT_DEVICE_NAME");
+
+    return name && *name ? g_strdup(name) : NULL;
+}
+
+static char *sdl_route_file_device_name(int rec, bool *present)
+{
+    const char *directory = g_getenv("OMARCHY_SDL_AUDIO_CONTROL_DIRECTORY");
+    g_autofree char *path = NULL;
+    g_autofree char *contents = NULL;
+    g_autofree guchar *decoded = NULL;
+    gsize decoded_length = 0;
+
+    *present = false;
+    if (!directory || !*directory) {
+        return NULL;
+    }
+    path = g_build_filename(directory, rec ? "input" : "output", NULL);
+    if (!g_file_get_contents(path, &contents, NULL, NULL)) {
+        return NULL;
+    }
+    g_strchomp(contents);
+    *present = true;
+    if (g_str_equal(contents, "default")) {
+        return NULL;
+    }
+    decoded = g_base64_decode(contents, &decoded_length);
+    if (!decoded_length || memchr(decoded, '\0', decoded_length) ||
+        !g_utf8_validate((const char *)decoded, decoded_length, NULL)) {
+        warn_report("Ignoring invalid Omarchy SDL route file");
+        *present = false;
+        return NULL;
+    }
+    return g_strndup((const char *)decoded, decoded_length);
+}
+
+static bool sdl_audio_specs_match(const SDL_AudioSpec *left,
+                                  const SDL_AudioSpec *right)
+{
+    return left->freq == right->freq &&
+           left->format == right->format &&
+           left->channels == right->channels &&
+           left->samples == right->samples;
+}
+
+static bool sdl_route_check_due(gint64 *next_check)
+{
+    gint64 now = g_get_monotonic_time();
+
+    if (now < *next_check) {
+        return false;
+    }
+    *next_check = now + 250 * 1000;
+    return true;
+}
+
 static SDL_AudioDeviceID sdl_open(SDL_AudioSpec *req, SDL_AudioSpec *obt,
-                                  int rec)
+                                  int rec, const char *device_name,
+                                  bool *route_matches)
 {
     SDL_AudioDeviceID devid;
 #ifndef _WIN32
@@ -178,7 +253,18 @@ static SDL_AudioDeviceID sdl_open(SDL_AudioSpec *req, SDL_AudioSpec *obt,
     }
 #endif
 
-    devid = SDL_OpenAudioDevice(NULL, rec, req, obt, 0);
+    devid = SDL_OpenAudioDevice(device_name, rec, req, obt, 0);
+    *route_matches = devid || !device_name;
+    if (!devid && device_name) {
+        warn_report(
+                "Requested SDL %s device disappeared; using system default",
+                rec ? "recording" : "playback");
+        SDL_ClearError();
+        devid = SDL_OpenAudioDevice(NULL, rec, req, obt, 0);
+        if (devid) {
+            *route_matches = false;
+        }
+    }
     if (!devid) {
         error_report("SDL_OpenAudioDevice for %s failed: %s",
                    rec ? "recording" : "playback", SDL_GetError());
@@ -280,12 +366,193 @@ static void sdl_callback_in(void *opaque, Uint8 *buf, int len)
     }
 }
 
+/*
+ * SDL keeps the physical host device running whenever it is open, so a merely
+ * paused voice still costs a full host render cycle while the guest is silent.
+ * Release the device outright when the frontend stops the stream and take it
+ * again when the stream starts. The reopen reuses the spec the voice was
+ * initialised with, so the guest never observes a format change.
+ *
+ * Reacquiring costs one device open on the first sample after silence. The
+ * frontend toggles this when the guest starts or stops a stream, not per
+ * buffer, so that open never lands in a hot path.
+ */
+static void sdl_release_out(SDLVoiceOut *sdl)
+{
+    if (!sdl->devid) {
+        return;
+    }
+    SDL_PauseAudioDevice(sdl->devid, 1);
+    SDL_CloseAudioDevice(sdl->devid);
+    sdl->devid = 0;
+}
+
+static bool sdl_acquire_out(SDLVoiceOut *sdl)
+{
+    g_autofree char *requested = NULL;
+    SDL_AudioSpec obtained;
+    SDL_AudioDeviceID devid;
+    bool present;
+    bool route_matches;
+
+    requested = sdl_route_file_device_name(0, &present);
+    if (!present) {
+        requested = g_strdup(sdl->device_name);
+    }
+    devid = sdl_open(&sdl->reopen_spec, &obtained, 0, requested,
+                     &route_matches);
+    if (!devid) {
+        return false;
+    }
+    if (!sdl_audio_specs_match(&sdl->reopen_spec, &obtained)) {
+        warn_report(
+                "Requested SDL playback route has an incompatible format");
+        SDL_CloseAudioDevice(devid);
+        return false;
+    }
+
+    SDL_PauseAudioDevice(devid, 1);
+    sdl->devid = devid;
+    g_free(sdl->device_name);
+    sdl->device_name = g_steal_pointer(&requested);
+    sdl->route_matches = route_matches;
+    sdl->next_route_check = 0;
+    return true;
+}
+
+static void sdl_refresh_route_Out(SDLVoiceOut *sdl)
+{
+    g_autofree char *requested = NULL;
+    SDL_AudioSpec obtained;
+    SDL_AudioDeviceID replacement;
+    bool present;
+    bool route_matches;
+
+    if (!sdl->devid) {
+        return;
+    }
+    if (!sdl_route_check_due(&sdl->next_route_check)) {
+        return;
+    }
+    requested = sdl_route_file_device_name(0, &present);
+    if (!present || (sdl->route_matches &&
+                     g_strcmp0(requested, sdl->device_name) == 0)) {
+        return;
+    }
+    replacement = sdl_open(&sdl->reopen_spec, &obtained, 0, requested,
+                           &route_matches);
+    if (!replacement) {
+        return;
+    }
+    if (!sdl_audio_specs_match(&sdl->reopen_spec, &obtained)) {
+        warn_report(
+                "Requested SDL playback route has an incompatible format");
+        SDL_CloseAudioDevice(replacement);
+        return;
+    }
+
+    SDL_PauseAudioDevice(replacement, 1);
+    SDL_PauseAudioDevice(sdl->devid, 1);
+    SDL_CloseAudioDevice(sdl->devid);
+    sdl->devid = replacement;
+    g_free(sdl->device_name);
+    sdl->device_name = g_steal_pointer(&requested);
+    sdl->route_matches = route_matches;
+    SDL_PauseAudioDevice(sdl->devid, !sdl->enabled);
+}
+
+/* The recording counterpart of sdl_release_out(). */
+static void sdl_release_in(SDLVoiceIn *sdl)
+{
+    if (!sdl->devid) {
+        return;
+    }
+    SDL_PauseAudioDevice(sdl->devid, 1);
+    SDL_CloseAudioDevice(sdl->devid);
+    sdl->devid = 0;
+}
+
+static bool sdl_acquire_in(SDLVoiceIn *sdl)
+{
+    g_autofree char *requested = NULL;
+    SDL_AudioSpec obtained;
+    SDL_AudioDeviceID devid;
+    bool present;
+    bool route_matches;
+
+    requested = sdl_route_file_device_name(1, &present);
+    if (!present) {
+        requested = g_strdup(sdl->device_name);
+    }
+    devid = sdl_open(&sdl->reopen_spec, &obtained, 1, requested,
+                     &route_matches);
+    if (!devid) {
+        return false;
+    }
+    if (!sdl_audio_specs_match(&sdl->reopen_spec, &obtained)) {
+        warn_report(
+                "Requested SDL recording route has an incompatible format");
+        SDL_CloseAudioDevice(devid);
+        return false;
+    }
+
+    SDL_PauseAudioDevice(devid, 1);
+    sdl->devid = devid;
+    g_free(sdl->device_name);
+    sdl->device_name = g_steal_pointer(&requested);
+    sdl->route_matches = route_matches;
+    sdl->next_route_check = 0;
+    return true;
+}
+
+static void sdl_refresh_route_In(SDLVoiceIn *sdl)
+{
+    g_autofree char *requested = NULL;
+    SDL_AudioSpec obtained;
+    SDL_AudioDeviceID replacement;
+    bool present;
+    bool route_matches;
+
+    if (!sdl->devid) {
+        return;
+    }
+    if (!sdl_route_check_due(&sdl->next_route_check)) {
+        return;
+    }
+    requested = sdl_route_file_device_name(1, &present);
+    if (!present || (sdl->route_matches &&
+                     g_strcmp0(requested, sdl->device_name) == 0)) {
+        return;
+    }
+    replacement = sdl_open(&sdl->reopen_spec, &obtained, 1, requested,
+                           &route_matches);
+    if (!replacement) {
+        return;
+    }
+    if (!sdl_audio_specs_match(&sdl->reopen_spec, &obtained)) {
+        warn_report(
+                "Requested SDL recording route has an incompatible format");
+        SDL_CloseAudioDevice(replacement);
+        return;
+    }
+
+    SDL_PauseAudioDevice(replacement, 1);
+    SDL_PauseAudioDevice(sdl->devid, 1);
+    SDL_CloseAudioDevice(sdl->devid);
+    sdl->devid = replacement;
+    g_free(sdl->device_name);
+    sdl->device_name = g_steal_pointer(&requested);
+    sdl->route_matches = route_matches;
+    SDL_PauseAudioDevice(sdl->devid, !sdl->enabled);
+}
+
 #define SDL_WRAPPER_FUNC(name, ret_type, args_decl, args, dir) \
     static ret_type glue(sdl_, name)args_decl                  \
     {                                                          \
         ret_type ret;                                          \
         glue(SDLVoice, dir) *sdl = (glue(SDLVoice, dir) *)hw;  \
                                                                \
+        glue(sdl_refresh_route_, glue(dir, ))(sdl);             \
         SDL_LockAudioDevice(sdl->devid);                       \
         ret = glue(audio_generic_, name)args;                  \
         SDL_UnlockAudioDevice(sdl->devid);                     \
@@ -298,6 +565,7 @@ static void sdl_callback_in(void *opaque, Uint8 *buf, int len)
     {                                                          \
         glue(SDLVoice, dir) *sdl = (glue(SDLVoice, dir) *)hw;  \
                                                                \
+        glue(sdl_refresh_route_, glue(dir, ))(sdl);             \
         SDL_LockAudioDevice(sdl->devid);                       \
         glue(audio_generic_, name)args;                        \
         SDL_UnlockAudioDevice(sdl->devid);                     \
@@ -324,6 +592,8 @@ static void sdl_fini_out(HWVoiceOut *hw)
     SDLVoiceOut *sdl = (SDLVoiceOut *)hw;
 
     sdl_close_out(sdl);
+    g_clear_pointer(&sdl->device_name, g_free);
+    sdl->next_route_check = 0;
 }
 
 static int sdl_init_out(HWVoiceOut *hw, struct audsettings *as)
@@ -345,7 +615,9 @@ static int sdl_init_out(HWVoiceOut *hw, struct audsettings *as)
     req.userdata = sdl;
 
     sdl->dev = dev;
-    sdl->devid = sdl_open(&req, &obt, 0);
+    sdl->device_name = sdl_initial_device_name(0);
+    sdl->devid = sdl_open(&req, &obt, 0, sdl->device_name,
+                          &sdl->route_matches);
     if (!sdl->devid) {
         return -1;
     }
@@ -363,8 +635,12 @@ static int sdl_init_out(HWVoiceOut *hw, struct audsettings *as)
     hw->samples = (spdo->has_buffer_count ? spdo->buffer_count : 4) *
         obt.samples;
 
+    sdl->reopen_spec = obt;
+    sdl->reopen_spec.callback = sdl_callback_out;
+    sdl->reopen_spec.userdata = sdl;
     sdl->initialized = 1;
     sdl->exit = 0;
+    sdl_release_out(sdl);
     return 0;
 }
 
@@ -372,7 +648,18 @@ static void sdl_enable_out(HWVoiceOut *hw, bool enable)
 {
     SDLVoiceOut *sdl = (SDLVoiceOut *)hw;
 
-    SDL_PauseAudioDevice(sdl->devid, !enable);
+    if (sdl->enabled == enable) {
+        return;
+    }
+    sdl->enabled = enable;
+    if (!enable) {
+        sdl_release_out(sdl);
+        return;
+    }
+    if (!sdl->devid && !sdl_acquire_out(sdl)) {
+        return;
+    }
+    SDL_PauseAudioDevice(sdl->devid, 0);
 }
 
 static void sdl_fini_in(HWVoiceIn *hw)
@@ -380,6 +667,8 @@ static void sdl_fini_in(HWVoiceIn *hw)
     SDLVoiceIn *sdl = (SDLVoiceIn *)hw;
 
     sdl_close_in(sdl);
+    g_clear_pointer(&sdl->device_name, g_free);
+    sdl->next_route_check = 0;
 }
 
 static int sdl_init_in(HWVoiceIn *hw, audsettings *as)
@@ -401,11 +690,14 @@ static int sdl_init_in(HWVoiceIn *hw, audsettings *as)
     req.userdata = sdl;
 
     sdl->dev = dev;
-    sdl->devid = sdl_open(&req, &obt, 1);
-    if (!sdl->devid) {
-        return -1;
-    }
-
+    sdl->device_name = sdl_initial_device_name(1);
+    /*
+     * Opening a recording device starts CoreAudio capture and trips macOS's
+     * privacy indicator. SDL is called with allowed_changes=0, so a
+     * successful open cannot change this requested spec; defer the real open
+     * until the guest enables a recording stream.
+     */
+    obt = req;
     err = sdl_to_audfmt(obt.format, &obt_as.fmt, &obt_as.big_endian);
     if (err) {
         sdl_close_in(sdl);
@@ -422,6 +714,9 @@ static int sdl_init_in(HWVoiceIn *hw, audsettings *as)
     hw->buf_emul = g_malloc(hw->size_emul);
     hw->pos_emul = hw->pending_emul = 0;
 
+    sdl->reopen_spec = obt;
+    sdl->reopen_spec.callback = sdl_callback_in;
+    sdl->reopen_spec.userdata = sdl;
     sdl->initialized = 1;
     sdl->exit = 0;
     return 0;
@@ -431,7 +726,18 @@ static void sdl_enable_in(HWVoiceIn *hw, bool enable)
 {
     SDLVoiceIn *sdl = (SDLVoiceIn *)hw;
 
-    SDL_PauseAudioDevice(sdl->devid, !enable);
+    if (sdl->enabled == enable) {
+        return;
+    }
+    sdl->enabled = enable;
+    if (!enable) {
+        sdl_release_in(sdl);
+        return;
+    }
+    if (!sdl->devid && !sdl_acquire_in(sdl)) {
+        return;
+    }
+    SDL_PauseAudioDevice(sdl->devid, 0);
 }
 
 static bool audio_sdl_realize(AudioBackend *abe, Audiodev *dev, Error **errp)
