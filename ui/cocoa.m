@@ -29,6 +29,7 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
 #include <crt_externs.h>
+#include <objc/runtime.h>
 #include <stdarg.h>
 
 #include "qemu/help-texts.h"
@@ -113,7 +114,17 @@ static int left_command_key_enabled = 1;
 static bool swap_opt_cmd;
 static bool full_grab_enabled;
 static bool immersive_mode_enabled = true;
+static bool notch_panel_enabled = true;
+@class QemuCocoaView;
+extern QemuCocoaView *cocoaView;
 static NSMenuItem *fullScreenMenuItem;
+
+/* What non-immersive full screen lets macOS show over the camera strip. */
+typedef enum {
+    COCOA_REVEAL_NONE,
+    COCOA_REVEAL_MENU_BAR,
+    COCOA_REVEAL_DOCK,
+} CocoaReveal;
 
 static bool zoom_interpolation;
 static NSTextField *pauseLabel;
@@ -434,7 +445,16 @@ static void handleAnyDeviceErrors(Error * err)
     bool mouseOn;
     CocoaPinch pinch;
     CocoaScroll scroll;
+    CocoaReveal notchReveal;
+    bool notchCovered;
+    bool notchLeaving;
+    bool menuTracking;
 }
+- (bool) coversNotch;
+- (void) updateNotchLevel;
+- (void) updateNotchReveal;
+- (void) setNotchLeaving:(bool)leaving;
+- (void) setMenuTracking:(bool)tracking;
 - (void) grabMouse;
 - (void) ungrabMouse;
 - (void) setFullGrab:(id)sender;
@@ -500,6 +520,123 @@ static void cocoa_pinch_send_frame(void *opaque, const CocoaPinchFrame *frame)
         }
     }
     qemu_input_event_sync();
+}
+
+/*
+ * The strip AppKit keeps clear of a camera housing at the top of this screen,
+ * in points, or 0: external displays, Macs without a notch and the built-in
+ * panel's modes below the camera have none. TRYOMARCHY_NOTCH=0 reports none
+ * anywhere, which keeps AppKit's full screen below the housing.
+ */
+static CGFloat cocoa_notch_strip(NSScreen *screen)
+{
+    if (!notch_panel_enabled || !screen) {
+        return 0;
+    }
+    return MAX(0, [screen safeAreaInsets].top);
+}
+
+/*
+ * Where the auto-hidden Dock comes out in non-immersive full screen, and how
+ * far from that edge it can reach (its tiles, magnified ones too, plus room).
+ */
+static NSRectEdge cocoa_dock_edge(void)
+{
+    NSRectEdge edge = NSRectEdgeMinY;
+    CFStringRef orientation = CFPreferencesCopyAppValue(CFSTR("orientation"),
+                                                        CFSTR("com.apple.dock"));
+
+    if (orientation && CFGetTypeID(orientation) == CFStringGetTypeID()) {
+        if (CFStringCompare(orientation, CFSTR("left"), 0) == kCFCompareEqualTo) {
+            edge = NSRectEdgeMinX;
+        } else if (CFStringCompare(orientation, CFSTR("right"), 0) == kCFCompareEqualTo) {
+            edge = NSRectEdgeMaxX;
+        }
+    }
+    if (orientation) {
+        CFRelease(orientation);
+    }
+    return edge;
+}
+
+static CGFloat cocoa_dock_reach(void)
+{
+    Boolean valid = false;
+    CFIndex tile = CFPreferencesGetAppIntegerValue(CFSTR("tilesize"),
+                                                   CFSTR("com.apple.dock"), &valid);
+    CFIndex reach = valid ? tile : 64;
+
+    if (CFPreferencesGetAppBooleanValue(CFSTR("magnification"),
+                                        CFSTR("com.apple.dock"), NULL)) {
+        CFIndex large = CFPreferencesGetAppIntegerValue(CFSTR("largesize"),
+                                                        CFSTR("com.apple.dock"), &valid);
+        reach = MAX(reach, valid ? large : 128);
+    }
+    return MIN(MAX(reach, 16), 256) + 32;
+}
+
+static CGFloat cocoa_edge_distance(NSPoint point, NSRect frame, NSRectEdge edge)
+{
+    switch (edge) {
+    case NSRectEdgeMinX:
+        return point.x - NSMinX(frame);
+    case NSRectEdgeMaxX:
+        return NSMaxX(frame) - point.x;
+    case NSRectEdgeMaxY:
+        return NSMaxY(frame) - point.y;
+    default:
+        return point.y - NSMinY(frame);
+    }
+}
+
+/*
+ * AppKit's full screen keeps the strip beside a camera housing for the menu
+ * bar: the content window stops below it, and the window server's menu bar
+ * (window level 24) paints it black, even with the menu bar hidden. AppKit
+ * asks its full-screen content controller whether to reserve that strip; on
+ * a screen with a housing the answer becomes no, so AppKit itself gives the
+ * window the whole display, also after a Space switch, a mode change or a
+ * lock. Public AppKit has no way to ask for that: setting the frame holds
+ * only until the window server tiles the Space again. The method is looked
+ * up at start and checked against its signature; without it full screen
+ * stays below the housing. QemuCocoaView raises the window over the menu
+ * bar's black strip while it has the keyboard (updateNotchLevel).
+ */
+static BOOL (*cocoa_reserves_menu_bar)(id, SEL);
+
+static BOOL cocoa_notch_reserves_menu_bar(id self, SEL cmd)
+{
+    BOOL reserves = cocoa_reserves_menu_bar(self, cmd);
+
+    /*
+     * macOS's "Always show the menu bar in full screen" wins over a menu bar
+     * that would only come out under the window (non-immersive).
+     */
+    if (reserves && !immersive_mode_enabled &&
+        [[NSUserDefaults standardUserDefaults]
+            boolForKey:@"AppleMenuBarVisibleInFullscreen"]) {
+        return reserves;
+    }
+    return reserves && cocoa_notch_strip([[(NSView *)cocoaView window] screen]) <= 0;
+}
+
+static void cocoa_notch_hook_install(void)
+{
+    Class controller = NSClassFromString(@"_NSFullScreenContentController");
+    SEL selector = NSSelectorFromString(@"reservesSpaceForMenuBarInFullScreen");
+    Method method = controller ? class_getInstanceMethod(controller, selector) : NULL;
+
+    if (!notch_panel_enabled) {
+        return;
+    }
+    if (!method || strcmp(method_getTypeEncoding(method), "B16@0:8") != 0) {
+        notch_panel_enabled = false;
+        info_report("Try Omarchy: full screen stays below the camera strip "
+                    "(AppKit's full-screen menu bar reservation changed)");
+        return;
+    }
+    cocoa_reserves_menu_bar = (BOOL (*)(id, SEL))method_setImplementation(
+        method, (IMP)cocoa_notch_reserves_menu_bar);
 }
 
 @implementation QemuCocoaView
@@ -782,10 +919,106 @@ static void cocoa_pinch_send_frame(void *opaque, const CocoaPinchFrame *frame)
     return fixed;
 }
 
+/* Full screen holds the whole display, the camera strip too. */
+- (bool) coversNotch
+{
+    NSWindow *window = [self window];
+    NSScreen *display = [window screen];
+
+    return ([window styleMask] & NSWindowStyleMaskFullScreen) &&
+           cocoa_notch_strip(display) > 0 &&
+           NSEqualRects([window frame], [display frame]);
+}
+
+/*
+ * The menu bar's black strip (window level 24) covers the camera strip of a
+ * full-screen window. Raise the window just above it while it covers the
+ * notch and has the keyboard. Everything else sits lower again: an alert or
+ * another app that takes the keyboard, the way out of full screen, and the
+ * menu bar or Dock that non-immersive full screen reveals.
+ */
+- (void) updateNotchLevel
+{
+    NSWindow *window = [self window];
+    bool covered = [self coversNotch];
+    bool raised = covered && !notchLeaving && [window isKeyWindow] &&
+                  [NSApp isActive] && notchReveal == COCOA_REVEAL_NONE &&
+                  !menuTracking;
+    NSWindowLevel level = raised ? NSStatusWindowLevel : NSNormalWindowLevel;
+
+    if ([window level] != level) {
+        [window setLevel:level];
+    }
+    if (covered != notchCovered) {
+        NSSize size = [[window screen] frame].size;
+
+        notchCovered = covered;
+        if (covered) {
+            info_report("Try Omarchy: full screen covers the camera strip "
+                        "(%gx%g points, strip %g)", size.width, size.height,
+                        cocoa_notch_strip([window screen]));
+        } else {
+            info_report("Try Omarchy: full screen no longer covers the camera strip");
+        }
+    }
+}
+
+/*
+ * Non-immersive full screen keeps macOS's auto-hidden menu bar and Dock.
+ * They come out under the raised window, so the window steps down while the
+ * pointer is at the top edge or the Dock's edge and comes back up once it
+ * moves on past them.
+ */
+- (void) updateNotchReveal
+{
+    NSWindow *window = [self window];
+    NSRect frame = [[window screen] frame];
+    NSPoint point = [NSEvent mouseLocation];
+    CGFloat strip = cocoa_notch_strip([window screen]);
+    CocoaReveal reveal = COCOA_REVEAL_NONE;
+
+    if (!immersive_mode_enabled && [self coversNotch]) {
+        CGFloat top = cocoa_edge_distance(point, frame, NSRectEdgeMaxY);
+        CGFloat dock = cocoa_edge_distance(point, frame, cocoa_dock_edge());
+
+        if (top <= 1 ||
+            (notchReveal == COCOA_REVEAL_MENU_BAR && top <= 2 * strip)) {
+            reveal = COCOA_REVEAL_MENU_BAR;
+        } else if (dock <= 1 ||
+                   (notchReveal == COCOA_REVEAL_DOCK && dock <= cocoa_dock_reach())) {
+            reveal = COCOA_REVEAL_DOCK;
+        }
+    }
+    if (reveal != notchReveal) {
+        notchReveal = reveal;
+        [self updateNotchLevel];
+    }
+}
+
+- (void) setNotchLeaving:(bool)leaving
+{
+    notchLeaving = leaving;
+    notchReveal = COCOA_REVEAL_NONE;
+    [self updateNotchLevel];
+}
+
+- (void) setMenuTracking:(bool)tracking
+{
+    menuTracking = tracking;
+    if (!tracking) {
+        [self updateNotchReveal];
+    }
+    [self updateNotchLevel];
+}
+
 - (NSSize) screenSafeAreaSize
 {
     NSSize size = [[[self window] screen] frame].size;
     NSEdgeInsets insets = [[[self window] screen] safeAreaInsets];
+
+    if ([self coversNotch]) {
+        return size;
+    }
     size.width -= insets.left + insets.right;
     size.height -= insets.top + insets.bottom;
     return size;
@@ -795,7 +1028,10 @@ static void cocoa_pinch_send_frame(void *opaque, const CocoaPinchFrame *frame)
 {
     [[self window] setContentAspectRatio:NSMakeSize(screen.width, screen.height)];
 
-    if (!([[self window] styleMask] & NSWindowStyleMaskResizable)) {
+    if ([self coversNotch]) {
+        /* The guest follows the whole display; keep the window on all of it. */
+        [[self window] setFrame:[[[self window] screen] frame] display:YES];
+    } else if (!([[self window] styleMask] & NSWindowStyleMaskResizable)) {
         CGFloat width = screen.width / [[self window] backingScaleFactor];
         CGFloat height = screen.height / [[self window] backingScaleFactor];
 
@@ -1504,6 +1740,7 @@ static NSSize cocoa_guest_frame_size(NSSize size, CGFloat scale)
 
 - (void) mouseMoved:(NSEvent *)event
 {
+    [self updateNotchReveal];
     [self handleMouseEvent:event];
 }
 
@@ -1524,6 +1761,7 @@ static NSSize cocoa_guest_frame_size(NSSize size, CGFloat scale)
 
 - (void) mouseDragged:(NSEvent *)event
 {
+    [self updateNotchReveal];
     [self handleMouseEvent:event];
 }
 
@@ -1768,8 +2006,26 @@ static NSRect cocoa_initial_window_frame(void)
         [pauseLabel setFont: [NSFont fontWithName: @"Helvetica" size: 90]];
         [pauseLabel setTextColor: [NSColor blackColor]];
         [pauseLabel sizeToFit];
+
+        /* A menu bar menu opens under a raised full-screen window. */
+        [[NSNotificationCenter defaultCenter] addObserver:self
+            selector:@selector(menuDidBeginTracking:)
+            name:NSMenuDidBeginTrackingNotification object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+            selector:@selector(menuDidEndTracking:)
+            name:NSMenuDidEndTrackingNotification object:nil];
     }
     return self;
+}
+
+- (void)menuDidBeginTracking:(NSNotification *)notification
+{
+    [cocoaView setMenuTracking:true];
+}
+
+- (void)menuDidEndTracking:(NSNotification *)notification
+{
+    [cocoaView setMenuTracking:false];
 }
 
 - (void) dealloc
@@ -1820,6 +2076,7 @@ static NSRect cocoa_initial_window_frame(void)
 {
     [cocoaView updateScale];
     [cocoaView updateUIInfo];
+    [cocoaView updateNotchLevel];
 }
 
 - (void)windowDidChangeBackingProperties:(NSNotification *)notification
@@ -1828,17 +2085,29 @@ static NSRect cocoa_initial_window_frame(void)
     [cocoaView updateUIInfo];
 }
 
+- (void)windowWillEnterFullScreen:(NSNotification *)notification
+{
+    [cocoaView setNotchLeaving:false];
+}
+
 - (void)windowDidEnterFullScreen:(NSNotification *)notification
 {
     [fullScreenMenuItem setTitle:@"Exit Full Screen"];
     [cocoaView updateScale];
     [cocoaView updateUIInfo];
+    [cocoaView updateNotchLevel];
     [cocoaView grabMouse];
+}
+
+- (void)windowWillExitFullScreen:(NSNotification *)notification
+{
+    [cocoaView setNotchLeaving:true];
 }
 
 - (void)windowDidExitFullScreen:(NSNotification *)notification
 {
     [fullScreenMenuItem setTitle:@"Enter Full Screen"];
+    [cocoaView setNotchLeaving:false];
     [cocoaView resizeWindow];
     [cocoaView updateScale];
     [cocoaView updateUIInfo];
@@ -1849,6 +2118,17 @@ static NSRect cocoa_initial_window_frame(void)
 {
     [cocoaView updateScale];
     [cocoaView updateUIInfo];
+    [cocoaView updateNotchLevel];
+}
+
+- (void)windowDidBecomeKey:(NSNotification *)notification
+{
+    [cocoaView updateNotchLevel];
+}
+
+- (void)applicationDidBecomeActive:(NSNotification *)notification
+{
+    [cocoaView updateNotchLevel];
 }
 
 /* Called when the user clicks on a window's close button */
@@ -1887,6 +2167,7 @@ static NSRect cocoa_initial_window_frame(void)
     COCOA_DEBUG("%s\n", __func__);
     [cocoaView ungrabMouse];
     [cocoaView raiseAllKeys];
+    [cocoaView updateNotchLevel];
 }
 /* App deactivation can arrive independently of a key-window notification.
  * Release both paths so a delayed window transition cannot strand input. */
@@ -1894,6 +2175,7 @@ static NSRect cocoa_initial_window_frame(void)
 {
     [cocoaView ungrabMouse];
     [cocoaView raiseAllKeys];
+    [cocoaView updateNotchLevel];
 }
 
 
@@ -3000,6 +3282,12 @@ static void cocoa_display_init(DisplayState *ds, DisplayOptions *opts)
                         opts->u.cocoa.full_grab;
     immersive_mode_enabled = !opts->u.cocoa.has_immersive ||
                              opts->u.cocoa.immersive;
+    notch_panel_enabled = !getenv("TRYOMARCHY_NOTCH") ||
+                          strcmp(getenv("TRYOMARCHY_NOTCH"), "0") != 0;
+    if (!notch_panel_enabled) {
+        info_report("Try Omarchy: full screen stays below the camera strip (TRYOMARCHY_NOTCH=0)");
+    }
+    cocoa_notch_hook_install();
 
     /* if fullscreen mode is to be used */
     if (opts->has_full_screen && opts->full_screen) {
