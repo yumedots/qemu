@@ -361,6 +361,7 @@ static void handleAnyDeviceErrors(Error * err)
 - (void) notifyMouseModeChange;
 - (BOOL) isMouseGrabbed;
 - (BOOL) isKeyboardCaptured;
+- (void) reenableEventTap;
 - (void) raiseAllKeys;
 @end
 
@@ -369,6 +370,12 @@ QemuCocoaView *cocoaView;
 static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEventRef cgEvent, void *userInfo)
 {
     QemuCocoaView *view = userInfo;
+    if (type == kCGEventTapDisabledByTimeout ||
+        type == kCGEventTapDisabledByUserInput) {
+        [view reenableEventTap];
+        return cgEvent;
+    }
+
     NSEvent *event = [NSEvent eventWithCGEvent:cgEvent];
     if (getenv("TRYOMARCHY_INPUT_OBSERVE_ONLY")) {
         [view isKeyboardCaptured];
@@ -1336,6 +1343,14 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         }
     }
     return captured;
+}
+
+/* macOS can disable a slow tap; restore capture after either notification. */
+- (void) reenableEventTap
+{
+    if (eventsTap) {
+        CGEventTapEnable(eventsTap, true);
+    }
 }
 
 /*
