@@ -360,6 +360,7 @@ static void handleAnyDeviceErrors(Error * err)
 - (bool) handleEventLocked:(NSEvent *)event;
 - (void) notifyMouseModeChange;
 - (BOOL) isMouseGrabbed;
+- (BOOL) isKeyboardCaptured;
 - (void) raiseAllKeys;
 @end
 
@@ -369,7 +370,11 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 {
     QemuCocoaView *view = userInfo;
     NSEvent *event = [NSEvent eventWithCGEvent:cgEvent];
-    if ([view isMouseGrabbed] && [view handleEvent:event]) {
+    if (getenv("TRYOMARCHY_INPUT_OBSERVE_ONLY")) {
+        [view isKeyboardCaptured];
+        return cgEvent;
+    }
+    if ([view isKeyboardCaptured] && [view handleEvent:event]) {
         COCOA_DEBUG("Global events tap: qemu handled the event, capturing!\n");
         return NULL;
     }
@@ -1039,10 +1044,9 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
                     }
                     break;
 
-                /* Don't pass command key changes to guest unless mouse is grabbed */
+                /* Don't pass command key changes to guest unless we captured the keyboard */
                 case kVK_Command:
-                    if (full_grab_enabled &&
-                        isMouseGrabbed &&
+                    if ([self isKeyboardCaptured] &&
                         !!(modifiers & NSEventModifierFlagCommand) &&
                         left_command_key_enabled) {
                         if (swap_opt_cmd) {
@@ -1054,8 +1058,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
                     break;
 
                 case kVK_RightCommand:
-                    if (full_grab_enabled &&
-                        isMouseGrabbed &&
+                    if ([self isKeyboardCaptured] &&
                         !!(modifiers & NSEventModifierFlagCommand)) {
                         if (swap_opt_cmd) {
                             [self toggleKey:KEY_RIGHTALT];
@@ -1069,8 +1072,9 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         case NSEventTypeKeyDown:
             keycode = cocoa_keycode_to_linux([event keyCode]);
 
-            // Keep Command chords with the host unless full grab owns them.
-            if ((!isMouseGrabbed || !full_grab_enabled) &&
+            // Keep Command chords with the host unless the focused guest
+            // captured the keyboard.
+            if (![self isKeyboardCaptured] &&
                 ([event modifierFlags] & NSEventModifierFlagCommand)) {
                 return false;
             }
@@ -1108,7 +1112,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
             // don't pass the guest a spurious key-up if we treated this
             // command-key combo as a host UI action
-            if ((!isMouseGrabbed || !full_grab_enabled) &&
+            if (![self isKeyboardCaptured] &&
                 ([event modifierFlags] & NSEventModifierFlagCommand)) {
                 return true;
             }
@@ -1294,6 +1298,45 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     }
 }
 - (BOOL) isMouseGrabbed {return isMouseGrabbed;}
+
+/*
+ * Keyboard capture is deliberately independent of the mouse grab. An
+ * absolute-pointing guest (virtio-tablet) makes notifyMouseModeChange drop
+ * the grab as soon as the guest driver comes up, and mouseExited drops it
+ * again whenever the pointer leaves the view; keying capture off the grab
+ * would hand host Command chords back to macOS mid-session, at a moment the
+ * user never asked for. With full grab enabled, our key window owns the
+ * keyboard in either fullscreen presentation and in windowed mode. Testing
+ * key-window focus independently of the event tap also preserves ordinary
+ * Command chords if Accessibility permission is unavailable; only system
+ * shortcuts that require the HID tap can then escape to macOS.
+ */
+- (BOOL) isKeyboardCaptured
+{
+    NSRunningApplication *frontmost =
+        [[NSWorkspace sharedWorkspace] frontmostApplication];
+    pid_t foregroundPID = frontmost ? [frontmost processIdentifier] : -1;
+    BOOL keyWindow = [[self window] isKeyWindow];
+    BOOL captured = foregroundPID == getpid() && keyWindow &&
+                    (isMouseGrabbed || full_grab_enabled);
+
+    /* Opt-in diagnostics contain focus state only, never key contents. */
+    if (getenv("TRYOMARCHY_INPUT_TRACE")) {
+        static pid_t lastForegroundPID = -2;
+        static int lastState = -1;
+        int state = ([NSApp isActive] ? 1 : 0) | (keyWindow ? 2 : 0) |
+                    (isMouseGrabbed ? 4 : 0) | (captured ? 8 : 0);
+        if (lastForegroundPID != foregroundPID || lastState != state) {
+            fprintf(stderr, "[input-focus] self=%d foreground=%d app-active=%d "
+                    "key-window=%d mouse-grab=%d captured=%d\n",
+                    getpid(), foregroundPID, !![NSApp isActive], !!keyWindow,
+                    !!isMouseGrabbed, !!captured);
+            lastForegroundPID = foregroundPID;
+            lastState = state;
+        }
+    }
+    return captured;
+}
 
 /*
  * Makes the target think all down keys are being released.
@@ -1536,6 +1579,14 @@ static NSRect cocoa_initial_window_frame(void)
     [cocoaView ungrabMouse];
     [cocoaView raiseAllKeys];
 }
+/* App deactivation can arrive independently of a key-window notification.
+ * Release both paths so a delayed window transition cannot strand input. */
+- (void) applicationDidResignActive: (NSNotification *)aNotification
+{
+    [cocoaView ungrabMouse];
+    [cocoaView raiseAllKeys];
+}
+
 
 /* We abstract the method called by the Enter Fullscreen menu item
  * because Mac OS 10.7 and higher disables it. This is because of the
