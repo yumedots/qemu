@@ -90,6 +90,13 @@ void hvf_unprotect_dirty_range(hwaddr addr, size_t size)
                      HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
 }
 
+/*
+ * Start addresses of the sections currently mapped into HVF. A section is
+ * removed with exactly the range it was added with, so its start address
+ * identifies it. The memory listener runs under the BQL.
+ */
+static GHashTable *hvf_mapped_sections;
+
 static void hvf_set_phys_mem(MemoryRegionSection *section, bool add)
 {
     MemoryRegion *area = section->mr;
@@ -119,7 +126,22 @@ static void hvf_set_phys_mem(MemoryRegionSection *section, bool add)
         add = false;
     }
 
+    if (!hvf_mapped_sections) {
+        hvf_mapped_sections = g_hash_table_new_full(g_int64_hash, g_int64_equal,
+                                                    g_free, NULL);
+    }
+
     if (!add) {
+        /*
+         * Like KVM's slot lookup: only unmap what was mapped. A ROM device
+         * leaving romd_mode gets its I/O section added with add = false, and
+         * that section is deleted again on the way back; neither was ever
+         * mapped. Unmapping a range HVF does not hold can get QEMU killed
+         * with EXC_GUARD (DEALLOC_GAP).
+         */
+        if (!g_hash_table_remove(hvf_mapped_sections, &gpa)) {
+            return;
+        }
         trace_hvf_vm_unmap(gpa, size);
         ret = hv_vm_unmap(gpa, size);
         assert_hvf_ok(ret);
@@ -135,6 +157,7 @@ static void hvf_set_phys_mem(MemoryRegionSection *section, bool add)
                      flags & HV_MEMORY_EXEC ?  'X' : '-');
     ret = hv_vm_map(mem, gpa, size, flags);
     assert_hvf_ok(ret);
+    g_hash_table_add(hvf_mapped_sections, g_memdup2(&gpa, sizeof(gpa)));
 }
 
 void hvf_report_free_pages(hwaddr gpa, void *host, size_t size)
