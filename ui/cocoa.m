@@ -823,6 +823,22 @@ static void cocoa_pinch_send_frame(void *opaque, const CocoaPinchFrame *frame)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
+/*
+ * The guest's preferred mode follows the window and survives a reset into the
+ * firmware. EDK2's graphics console needs 80x25 cells of 8x19 pixels
+ * (640x475) and asserts below that, which hangs QEMU's DEBUG build after a
+ * guest reboot in a small window. Never offer the guest fewer than 800x600
+ * pixels; zoom-to-fit scales a smaller window.
+ */
+static NSSize cocoa_guest_frame_size(NSSize size, CGFloat scale)
+{
+    if (scale <= 0) {
+        scale = 1;
+    }
+    return NSMakeSize(MAX(size.width, ceil(800.0 / scale)),
+                      MAX(size.height, ceil(600.0 / scale)));
+}
+
 - (void) updateUIInfoLocked
 {
     /* Must be called with the BQL, i.e. via updateUIInfo */
@@ -840,7 +856,9 @@ static void cocoa_pinch_send_frame(void *opaque, const CocoaPinchFrame *frame)
         CVDisplayLinkRef displayLink;
         uint32_t refreshRate = 0;
 
-        frameSize = isFullscreen ? [self screenSafeAreaSize] : [self frame].size;
+        frameSize = cocoa_guest_frame_size(
+            isFullscreen ? [self screenSafeAreaSize] : [self frame].size,
+            [[self window] backingScaleFactor]);
 
         if (!CVDisplayLinkCreateWithCGDisplay(display, &displayLink)) {
             CVTime period = CVDisplayLinkGetNominalOutputVideoRefreshPeriod(displayLink);
@@ -876,7 +894,7 @@ static void cocoa_pinch_send_frame(void *opaque, const CocoaPinchFrame *frame)
         info.height_mm = 10 * MIN(255, MAX(1, (int)lround(
             frameSize.height * 2.54 / 110.0)));
     } else {
-        frameSize = [self frame].size;
+        frameSize = cocoa_guest_frame_size([self frame].size, 1);
         info.width_mm = 0;
         info.height_mm = 0;
     }
