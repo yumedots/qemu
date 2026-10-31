@@ -101,6 +101,12 @@ typedef struct FsDriverEntry {
     FsThrottle fst;
     mode_t fmode;
     mode_t dmode;
+    /*
+     * Try Omarchy: present the exporting host user's files to the guest as
+     * these credentials (security_model=none only). -1 disables the remap.
+     */
+    uid_t guest_owner_uid;
+    gid_t guest_owner_gid;
     /* temporary storage for parse_opts only */
     uint32_t max_xattr;
 } FsDriverEntry;
@@ -116,6 +122,8 @@ struct FsContext {
     void *private;
     mode_t fmode;
     mode_t dmode;
+    uid_t guest_owner_uid;
+    gid_t guest_owner_gid;
     /* max. amount of simultaneously open xattr FIDs */
     uint32_t xattr_fid_limit;
     /* current amount of open xattr FIDs */

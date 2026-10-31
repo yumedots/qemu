@@ -183,6 +183,25 @@ static void local_mapped_file_attr(int dirfd, const char *name,
     fclose(fp);
 }
 
+/*
+ * Try Omarchy: with security_model=none every host operation runs as the
+ * QEMU process user, so files that user owns are the ones the guest can
+ * actually modify. Report them as owned by the configured guest account so
+ * the guest kernel's permission checks agree with the host's.
+ */
+static void local_remap_guest_owner(FsContext *fs_ctx, struct stat *stbuf)
+{
+    if (!(fs_ctx->export_flags & V9FS_SM_NONE)) {
+        return;
+    }
+    if (fs_ctx->guest_owner_uid != (uid_t)-1 && stbuf->st_uid == geteuid()) {
+        stbuf->st_uid = fs_ctx->guest_owner_uid;
+    }
+    if (fs_ctx->guest_owner_gid != (gid_t)-1 && stbuf->st_gid == getegid()) {
+        stbuf->st_gid = fs_ctx->guest_owner_gid;
+    }
+}
+
 static int local_lstat(FsContext *fs_ctx, V9fsPath *fs_path, struct stat *stbuf)
 {
     int err = -1;
@@ -225,6 +244,7 @@ static int local_lstat(FsContext *fs_ctx, V9fsPath *fs_path, struct stat *stbuf)
     } else if (fs_ctx->export_flags & V9FS_SM_MAPPED_FILE) {
         local_mapped_file_attr(dirfd, name, stbuf);
     }
+    local_remap_guest_owner(fs_ctx, stbuf);
 
 err_out:
     close_preserve_errno(dirfd);
@@ -819,6 +839,7 @@ static int local_fstat(FsContext *fs_ctx, int fid_type,
         errno = EOPNOTSUPP;
         return -1;
     }
+    local_remap_guest_owner(fs_ctx, stbuf);
     return err;
 }
 
@@ -1607,6 +1628,30 @@ static int local_parse_opts(QemuOpts *opts, FsDriverEntry *fse, Error **errp)
             error_setg(errp, "dmode is only valid for mapped security modes");
             return -1;
         }
+    }
+
+    fse->guest_owner_uid = (uid_t)-1;
+    fse->guest_owner_gid = (gid_t)-1;
+    if (qemu_opt_find(opts, "guest_owner_uid") ||
+        qemu_opt_find(opts, "guest_owner_gid")) {
+        uint64_t owner_uid = qemu_opt_get_number(opts, "guest_owner_uid",
+                                                 (uint64_t)-1);
+        uint64_t owner_gid = qemu_opt_get_number(opts, "guest_owner_gid",
+                                                 (uint64_t)-1);
+
+        if (!(fse->export_flags & V9FS_SM_NONE)) {
+            error_setg(errp, "guest_owner_uid and guest_owner_gid are only "
+                       "valid for security_model=none");
+            return -1;
+        }
+        if (owner_uid == (uint64_t)-1 || owner_gid == (uint64_t)-1 ||
+            owner_uid >= (uid_t)-1 || owner_gid >= (gid_t)-1) {
+            error_setg(errp, "guest_owner_uid and guest_owner_gid must both "
+                       "be set to valid ids");
+            return -1;
+        }
+        fse->guest_owner_uid = (uid_t)owner_uid;
+        fse->guest_owner_gid = (gid_t)owner_gid;
     }
 
     fse->path = g_strdup(path);

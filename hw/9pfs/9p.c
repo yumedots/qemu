@@ -4462,6 +4462,8 @@ int v9fs_device_realize_common(V9fsState *s, const V9fsTransport *t,
 
     s->ctx.fmode = fse->fmode;
     s->ctx.dmode = fse->dmode;
+    s->ctx.guest_owner_uid = fse->guest_owner_uid;
+    s->ctx.guest_owner_gid = fse->guest_owner_gid;
 
     s->fids = g_hash_table_new(NULL, NULL);
     qemu_co_rwlock_init(&s->rename_lock);
