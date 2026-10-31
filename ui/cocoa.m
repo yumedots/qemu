@@ -111,6 +111,23 @@ static QKbdState *kbd;
 static int64_t injectedTextSource;
 static int cursor_hide = 1;
 static int left_command_key_enabled = 1;
+
+/* Device-dependent Command bits of -[NSEvent modifierFlags] (IOLLEvent.h). */
+#define COCOA_DEVICE_LEFT_COMMAND  0x00000008
+#define COCOA_DEVICE_RIGHT_COMMAND 0x00000010
+
+/*
+ * Whether the Command key named by device_bit is down. Events posted without
+ * device bits (CGEventPost tools, some remote-control apps) carry only the
+ * generic Command flag, so fall back to it.
+ */
+static bool cocoa_command_down(NSUInteger modifiers, NSUInteger device_bit)
+{
+    if (modifiers & (COCOA_DEVICE_LEFT_COMMAND | COCOA_DEVICE_RIGHT_COMMAND)) {
+        return modifiers & device_bit;
+    }
+    return modifiers & NSEventModifierFlagCommand;
+}
 static bool swap_opt_cmd;
 static bool full_grab_enabled;
 static bool immersive_mode_enabled = true;
@@ -449,6 +466,9 @@ static void handleAnyDeviceErrors(Error * err)
     bool notchCovered;
     bool notchLeaving;
     bool menuTracking;
+    /* Host Command keys currently held down in the guest. */
+    BOOL leftCommandGuestDown;
+    BOOL rightCommandGuestDown;
 }
 - (bool) coversNotch;
 - (void) updateNotchLevel;
@@ -1220,6 +1240,18 @@ static NSSize cocoa_guest_frame_size(NSSize size, CGFloat scale)
     qkbd_state_key_event(kbd, keycode, !qkbd_state_key_get(kbd, keycode));
 }
 
+- (void) setCommandKey:(bool)right down:(bool)down
+{
+    unsigned int keycode = swap_opt_cmd ? (right ? KEY_RIGHTALT : KEY_LEFTALT)
+                                        : (right ? KEY_RIGHTMETA : KEY_LEFTMETA);
+    qkbd_state_key_event(kbd, keycode, down);
+    if (right) {
+        rightCommandGuestDown = down;
+    } else {
+        leftCommandGuestDown = down;
+    }
+}
+
 // Does the work of sending input to the monitor
 - (void) handleMonitorInput:(NSEvent *)event
 {
@@ -1491,7 +1523,16 @@ static NSSize cocoa_guest_frame_size(NSSize size, CGFloat scale)
             qkbd_state_key_event(kbd, KEY_RIGHTALT, false);
         }
     }
-    if (!(modifiers & NSEventModifierFlagCommand)) {
+    /*
+     * While the keyboard is captured, the HID tap consumes Command's
+     * flagsChanged before AppKit records it, so the next key can arrive
+     * without NSEventModifierFlagCommand. Releasing guest Super here would
+     * split every Command chord into Super down, Super up, key. Command's
+     * own flagsChanged below releases it instead.
+     */
+    if (!(modifiers & NSEventModifierFlagCommand) &&
+        !([self isKeyboardCaptured] &&
+          (leftCommandGuestDown || rightCommandGuestDown))) {
         if (swap_opt_cmd) {
             qkbd_state_key_event(kbd, KEY_LEFTALT, false);
             qkbd_state_key_event(kbd, KEY_RIGHTALT, false);
@@ -1499,6 +1540,8 @@ static NSSize cocoa_guest_frame_size(NSSize size, CGFloat scale)
             qkbd_state_key_event(kbd, KEY_LEFTMETA, false);
             qkbd_state_key_event(kbd, KEY_RIGHTMETA, false);
         }
+        leftCommandGuestDown = NO;
+        rightCommandGuestDown = NO;
     }
 
     if (qemu_console_is_graphic(dcl.con) && [self handleInjectedText:event]) {
@@ -1552,29 +1595,29 @@ static NSSize cocoa_guest_frame_size(NSSize size, CGFloat scale)
                     }
                     break;
 
-                /* Don't pass command key changes to guest unless we captured the keyboard */
-                case kVK_Command:
-                    if ([self isKeyboardCaptured] &&
-                        !!(modifiers & NSEventModifierFlagCommand) &&
-                        left_command_key_enabled) {
-                        if (swap_opt_cmd) {
-                            [self toggleKey:KEY_LEFTALT];
-                        } else {
-                            [self toggleKey:KEY_LEFTMETA];
-                        }
+                /*
+                 * Press Command in the guest only while the keyboard is
+                 * captured. The key's own device bit says whether it is now
+                 * down, so a release always reaches the guest, captured or not.
+                 */
+                case kVK_Command: {
+                    bool down = [self isKeyboardCaptured] &&
+                                left_command_key_enabled &&
+                                cocoa_command_down(modifiers, COCOA_DEVICE_LEFT_COMMAND);
+                    if (down != leftCommandGuestDown) {
+                        [self setCommandKey:false down:down];
                     }
                     break;
+                }
 
-                case kVK_RightCommand:
-                    if ([self isKeyboardCaptured] &&
-                        !!(modifiers & NSEventModifierFlagCommand)) {
-                        if (swap_opt_cmd) {
-                            [self toggleKey:KEY_RIGHTALT];
-                        } else {
-                            [self toggleKey:KEY_RIGHTMETA];
-                        }
+                case kVK_RightCommand: {
+                    bool down = [self isKeyboardCaptured] &&
+                                cocoa_command_down(modifiers, COCOA_DEVICE_RIGHT_COMMAND);
+                    if (down != rightCommandGuestDown) {
+                        [self setCommandKey:true down:down];
                     }
                     break;
+                }
             }
             return true;
         case NSEventTypeKeyDown:
@@ -1894,6 +1937,8 @@ static NSSize cocoa_guest_frame_size(NSSize size, CGFloat scale)
         [self endPinchLocked];
         injectedTextSource = 0;
         qkbd_state_lift_all_keys(kbd);
+        leftCommandGuestDown = NO;
+        rightCommandGuestDown = NO;
     });
 }
 
