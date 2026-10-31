@@ -39,12 +39,40 @@
 
 #ifdef CONFIG_DARWIN
 #include <CoreFoundation/CoreFoundation.h>
+#include <pthread/qos.h>
+#endif
+
+#ifdef CONFIG_DARWIN
+/*
+ * The main loop feeds the sound card (HDA DMA and the audio timer)
+ * and runs virgl. At the default QoS it competes with the vCPU threads, so a
+ * busy guest on a busy Mac delays it by tens of ms and the sound breaks up.
+ * User-interactive QoS (as the window thread) puts it first.
+ * TRYOMARCHY_MAIN_LOOP_QOS=default keeps the default.
+ */
+static void tryomarchy_main_loop_qos(void)
+{
+    const char *v = getenv("TRYOMARCHY_MAIN_LOOP_QOS");
+
+    if (v && strcmp(v, "default") == 0) {
+        fprintf(stderr, "Try Omarchy: main loop QoS: default\n");
+        return;
+    }
+    if (pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) != 0) {
+        fprintf(stderr, "Try Omarchy: main loop QoS: default (user-interactive refused)\n");
+        return;
+    }
+    fprintf(stderr, "Try Omarchy: main loop QoS: user-interactive\n");
+}
 #endif
 
 static void *qemu_default_main(void *opaque)
 {
     int status;
 
+#ifdef CONFIG_DARWIN
+    tryomarchy_main_loop_qos();
+#endif
     replay_mutex_lock();
     bql_lock();
     status = qemu_main_loop();
