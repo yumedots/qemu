@@ -542,11 +542,42 @@ static void virgl_cmd_resource_flush(VirtIOGPU *g,
     }
 }
 
+static DisplayGLTexture virgl_borrow_texture_for_scanout(uint32_t id)
+{
+    DisplayGLTexture texture = {};
+    struct virgl_renderer_resource_info info;
+    int ret;
+
+#if VIRGL_VERSION_MAJOR >= 1
+    struct virgl_renderer_resource_info_ext ext;
+    memset(&ext, 0, sizeof(ext));
+#ifdef HAVE_VIRGL_RENDERER_BORROW_TEXTURE_FOR_SCANOUT
+    ret = virgl_renderer_borrow_texture_for_scanout(id, &ext);
+#else
+    ret = virgl_renderer_resource_get_info_ext(id, &ext);
+#endif
+    info = ext.base;
+    texture.d3d_tex2d = ext.d3d_tex2d;
+#else
+    memset(&info, 0, sizeof(info));
+    ret = virgl_renderer_resource_get_info(id, &info);
+#endif
+    if (ret) {
+        return texture;
+    }
+
+    texture.y_0_top = info.flags & VIRTIO_GPU_RESOURCE_FLAG_Y_0_TOP;
+    texture.width = info.width;
+    texture.height = info.height;
+    texture.id = info.tex_id;
+
+    return texture;
+}
+
 static void virgl_cmd_set_scanout(VirtIOGPU *g,
                                   struct virtio_gpu_ctrl_command *cmd)
 {
     struct virtio_gpu_set_scanout ss;
-    int ret;
 
     VIRTIO_GPU_FILL_CMD(ss);
     trace_virtio_gpu_cmd_set_scanout(ss.scanout_id, ss.resource_id,
@@ -563,6 +594,7 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
     if (ss.resource_id) {
         struct virgl_renderer_resource_info info;
         void *d3d_tex2d = NULL;
+        int ret;
 
 #if VIRGL_VERSION_MAJOR >= 1
         struct virgl_renderer_resource_info_ext ext;
@@ -590,11 +622,9 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
                             ss.r.width, ss.r.height);
         virgl_renderer_force_ctx_0();
         qemu_console_gl_scanout_texture(
-            g->parent_obj.scanout[ss.scanout_id].con, info.tex_id,
-            info.flags & VIRTIO_GPU_RESOURCE_FLAG_Y_0_TOP,
-            info.width, info.height,
-            ss.r.x, ss.r.y, ss.r.width, ss.r.height,
-            d3d_tex2d);
+            g->parent_obj.scanout[ss.scanout_id].con, ss.resource_id,
+            virgl_borrow_texture_for_scanout,
+            ss.r.x, ss.r.y, ss.r.width, ss.r.height);
     } else {
         qemu_console_set_surface(g->parent_obj.scanout[ss.scanout_id].con, NULL);
         qemu_console_gl_scanout_disable(g->parent_obj.scanout[ss.scanout_id].con);

@@ -93,16 +93,23 @@ struct QemuConsoleClass {
     char * (*get_label)(const QemuConsole *con);
 };
 
+typedef struct DisplayGLTexture {
+    uint32_t id;
+    bool y_0_top;
+    uint32_t width;
+    uint32_t height;
+    void *d3d_tex2d;
+} DisplayGLTexture;
+
+typedef DisplayGLTexture (*DisplayGLTextureBorrower)(uint32_t id);
+
 typedef struct ScanoutTexture {
     uint32_t backing_id;
-    bool backing_y_0_top;
-    uint32_t backing_width;
-    uint32_t backing_height;
+    DisplayGLTextureBorrower backing_borrow;
     uint32_t x;
     uint32_t y;
     uint32_t width;
     uint32_t height;
-    void *d3d_tex2d;
 } ScanoutTexture;
 
 typedef struct QemuUIInfo {
@@ -202,12 +209,9 @@ typedef struct DisplayChangeListenerOps {
     /* required if GL */
     void (*dpy_gl_scanout_texture)(DisplayChangeListener *dcl,
                                    uint32_t backing_id,
-                                   bool backing_y_0_top,
-                                   uint32_t backing_width,
-                                   uint32_t backing_height,
+                                   DisplayGLTextureBorrower backing_borrow,
                                    uint32_t x, uint32_t y,
-                                   uint32_t w, uint32_t h,
-                                   void *d3d_tex2d);
+                                   uint32_t w, uint32_t h);
     /* optional (default to true if has dpy_gl_scanout_dmabuf) */
     bool (*dpy_has_dmabuf)(DisplayChangeListener *dcl);
     /* optional */
@@ -289,11 +293,10 @@ bool qemu_console_check_format(QemuConsole *con,
                                pixman_format_code_t format);
 
 void qemu_console_gl_scanout_disable(QemuConsole *con);
-void qemu_console_gl_scanout_texture(QemuConsole *con,
-                                     uint32_t backing_id, bool backing_y_0_top,
-                                     uint32_t backing_width, uint32_t backing_height,
-                                     uint32_t x, uint32_t y, uint32_t w, uint32_t h,
-                                     void *d3d_tex2d);
+void qemu_console_gl_scanout_texture(QemuConsole *con, uint32_t backing_id,
+                                     DisplayGLTextureBorrower backing_borrow,
+                                     uint32_t x, uint32_t y,
+                                     uint32_t w, uint32_t h);
 void qemu_console_gl_scanout_dmabuf(QemuConsole *con,
                                     QemuDmaBuf *dmabuf);
 void qemu_console_gl_cursor_dmabuf(QemuConsole *con, QemuDmaBuf *dmabuf,
