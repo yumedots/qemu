@@ -19,6 +19,10 @@ sed -i '' \
   "$script"
 grep -q 'GPU_RUNTIME_QEMU' "$script"
 ! grep -q '^patch -d "$source_dir" ' "$script"
+if command -v brew >/dev/null; then
+  PATH="$(brew --prefix)/bin:$PATH"
+fi
+[[ $(command -v python3) != /usr/bin/python3 ]]
 GPU_RUNTIME_QEMU=$source_dir "$script"
 runtime="$work/try/macos/.build/qemu-gpu-runtime"
 test -x "$runtime/bin/qemu-system-aarch64" || ls -R "$runtime/bin"

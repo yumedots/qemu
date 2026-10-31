@@ -1,0 +1,44 @@
+name: build gpu runtime
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-gpu-runtime-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  runtime:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build
+        run: scripts/buildGpuRuntime.sh "$PWD/qemu-gpu-runtime.arm64.tgz"
+
+      - name: check
+        run: |
+          set -euo pipefail
+          mkdir check
+          tar xzf qemu-gpu-runtime.arm64.tgz -C check
+          check/bin/qemu-system-aarch64 --version
+          check/bin/qemu-system-aarch64 -device help | grep -q virtio-gpu-gl-pci
+          codesign -d --entitlements - check/bin/qemu-system-aarch64 2>&1 | grep -q com.apple.security.hypervisor
+          ! otool -L check/bin/qemu-system-aarch64 | grep -E '/opt/homebrew|/usr/local'
+
+      - name: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shasum -a 256 qemu-gpu-runtime.arm64.tgz | tee qemu-gpu-runtime.arm64.tgz.sha256
+          tag="gpu-${GITHUB_SHA}"
+          gh release create "$tag" --title "$tag" --notes "gpu runtime built from $GITHUB_SHA" \
+            qemu-gpu-runtime.arm64.tgz qemu-gpu-runtime.arm64.tgz.sha256 \
+            || gh release upload "$tag" --clobber qemu-gpu-runtime.arm64.tgz qemu-gpu-runtime.arm64.tgz.sha256
