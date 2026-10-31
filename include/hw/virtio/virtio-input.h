@@ -31,6 +31,7 @@ OBJECT_DECLARE_TYPE(VirtIOInput, VirtIOInputClass,
 #define TYPE_VIRTIO_MOUSE      "virtio-mouse-device"
 #define TYPE_VIRTIO_TABLET     "virtio-tablet-device"
 #define TYPE_VIRTIO_MULTITOUCH "virtio-multitouch-device"
+#define TYPE_VIRTIO_PINCH      "virtio-pinch-device"
 
 OBJECT_DECLARE_SIMPLE_TYPE(VirtIOInputHID, VIRTIO_INPUT_HID)
 #define VIRTIO_INPUT_HID_GET_PARENT_CLASS(obj) \

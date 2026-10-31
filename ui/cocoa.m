@@ -37,6 +37,7 @@
 #include "ui/clipboard.h"
 #include "ui/console.h"
 #include "ui/input.h"
+#include "ui/cocoa-pinch.h"
 #include "ui/kbd-state.h"
 #include "system/system.h"
 #include "system/runstate.h"
@@ -351,6 +352,7 @@ static void handleAnyDeviceErrors(Error * err)
     int mouseX;
     int mouseY;
     bool mouseOn;
+    CocoaPinch pinch;
 }
 - (void) grabMouse;
 - (void) ungrabMouse;
@@ -363,9 +365,20 @@ static void handleAnyDeviceErrors(Error * err)
 - (BOOL) isKeyboardCaptured;
 - (void) reenableEventTap;
 - (void) raiseAllKeys;
+- (void) endPinchLocked;
+- (void) resetPinchLocked:(bool)running;
+- (bool) handlePinchLocked:(NSEvent *)event;
 @end
 
 QemuCocoaView *cocoaView;
+static VMChangeStateEntry *pinch_vm_change;
+
+/* VM state callbacks hold the BQL; this method only touches input state. */
+static void cocoa_pinch_vm_change(void *opaque, bool running, RunState state)
+{
+    [cocoaView resetPinchLocked:running];
+}
+
 
 static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEventRef cgEvent, void *userInfo)
 {
@@ -388,6 +401,24 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     COCOA_DEBUG("Global events tap: qemu did not handle the event, letting it through...\n");
 
     return cgEvent;
+}
+
+/* Called under the same BQL as normal Cocoa input. */
+static void cocoa_pinch_send_frame(void *opaque, const CocoaPinchFrame *frame)
+{
+    for (int slot = 0; slot < 2; slot++) {
+        qemu_input_queue_mtt(dcl.con,
+                            frame->down ? INPUT_MULTI_TOUCH_TYPE_UPDATE :
+                                          INPUT_MULTI_TOUCH_TYPE_END,
+                            slot, frame->down ? slot : -1);
+        if (frame->down) {
+            qemu_input_queue_mtt_abs(dcl.con, INPUT_AXIS_X, frame->x[slot], 0,
+                                    COCOA_PINCH_AXIS_MAX, slot, slot);
+            qemu_input_queue_mtt_abs(dcl.con, INPUT_AXIS_Y, COCOA_PINCH_CENTER, 0,
+                                    COCOA_PINCH_AXIS_MAX, slot, slot);
+        }
+    }
+    qemu_input_event_sync();
 }
 
 @implementation QemuCocoaView
@@ -919,6 +950,40 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     }
 }
 
+- (void) resetPinchLocked:(bool)running
+{
+    cocoa_pinch_vm_state(&pinch, running, cocoa_pinch_send_frame, NULL);
+}
+
+- (void) endPinchLocked
+{
+    cocoa_pinch_cancel(&pinch, cocoa_pinch_send_frame, NULL);
+}
+
+- (bool) handlePinchLocked:(NSEvent *)event
+{
+    NSEventPhase phase = [event phase];
+    NSPoint point = [self convertPoint:[event locationInWindow] fromView:nil];
+    unsigned action = 0;
+    bool eligible = [event window] == [self window] &&
+                    [[self window] isKeyWindow] &&
+                    NSPointInRect(point, [self bounds]) &&
+                    qemu_console_is_graphic(dcl.con) &&
+                    runstate_is_running();
+
+    if (phase & NSEventPhaseBegan) {
+        action |= COCOA_PINCH_BEGIN;
+    }
+    if (phase & NSEventPhaseEnded) {
+        action |= COCOA_PINCH_END;
+    }
+    if (phase & NSEventPhaseCancelled) {
+        action |= COCOA_PINCH_CANCEL;
+    }
+    return cocoa_pinch_event(&pinch, action, eligible, [event magnification],
+                            cocoa_pinch_send_frame, NULL);
+}
+
 - (bool) handleEvent:(NSEvent *)event
 {
     return bool_with_bql(^{
@@ -1128,6 +1193,8 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
                 qkbd_state_key_event(kbd, keycode, false);
             }
             return true;
+        case NSEventTypeMagnify:
+            return [self handlePinchLocked:event];
         case NSEventTypeScrollWheel:
             /*
              * Send wheel events to the guest regardless of window focus.
@@ -1361,6 +1428,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 - (void) raiseAllKeys
 {
     with_bql(^{
+        [self endPinchLocked];
         qkbd_state_lift_all_keys(kbd);
     });
 }
@@ -2722,6 +2790,8 @@ static void cocoa_display_init(DisplayState *ds, DisplayOptions *opts)
     qemu_add_mouse_mode_change_notifier(&mouse_mode_change_notifier);
     [cocoaView notifyMouseModeChange];
     [cocoaView updateUIInfo];
+    pinch_vm_change = qemu_add_vm_change_state_handler(cocoa_pinch_vm_change,
+                                                       NULL);
 
     qemu_event_init(&cbevent, false);
     cbowner = [[QemuCocoaPasteboardTypeOwner alloc] init];
@@ -2744,6 +2814,7 @@ static void cocoa_display_cleanup(void)
 
     qemu_console_unregister_listener(&dcl);
     g_clear_pointer(&kbd, qkbd_state_free);
+    qemu_del_vm_change_state_handler(pinch_vm_change);
     qemu_remove_mouse_mode_change_notifier(&mouse_mode_change_notifier);
     qemu_clipboard_peer_unregister(&cbpeer);
     g_clear_pointer(&cbinfo, qemu_clipboard_info_unref);

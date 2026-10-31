@@ -529,6 +529,132 @@ static const TypeInfo virtio_multitouch_info = {
     .instance_init = virtio_multitouch_init,
 };
 
+/*
+ * A dedicated two-contact, indirect device for Cocoa magnification. It does
+ * not subscribe to BTN/ABS/REL events: the existing tablet retains all normal
+ * pointer input. Slot zero carries the two-contact lifecycle; slot one is
+ * always its symmetric partner. There is no persistent backend contact state,
+ * so virtio reset/migration uses the existing input device machinery.
+ */
+static void virtio_pinch_send(VirtIOInput *vinput, int type, int code, int value)
+{
+    virtio_input_event event = {
+        .type = cpu_to_le16(type),
+        .code = cpu_to_le16(code),
+        .value = cpu_to_le32(value),
+    };
+    virtio_input_send(vinput, &event);
+}
+
+static void virtio_pinch_event(DeviceState *dev, QemuConsole *src,
+                               QemuInputEvent *evt)
+{
+    VirtIOInput *vinput = VIRTIO_INPUT(dev);
+    InputMultiTouchEvent *mtt = &evt->mtt;
+
+    if (evt->type != INPUT_EVENT_KIND_MTT || mtt->slot < 0 || mtt->slot > 1) {
+        return;
+    }
+    if (mtt->slot == 0) {
+        if (mtt->type != INPUT_MULTI_TOUCH_TYPE_DATA) {
+            /* BTN_TOUCH must precede the axes within the frame. */
+            bool down = mtt->tracking_id >= 0;
+            virtio_pinch_send(vinput, EV_KEY, BTN_TOUCH, down);
+            virtio_pinch_send(vinput, EV_KEY, BTN_TOOL_DOUBLETAP, down);
+        } else if (mtt->axis == INPUT_AXIS_X || mtt->axis == INPUT_AXIS_Y) {
+            virtio_pinch_send(vinput, EV_ABS, axismap_abs[mtt->axis],
+                              mtt->value);
+        }
+    }
+    virtio_input_handle_event(dev, src, evt);
+}
+
+static const QemuInputHandler virtio_pinch_handler = {
+    .name = "QEMU Virtio Pinch Touchpad",
+    .mask = INPUT_EVENT_MASK_MTT,
+    .event = virtio_pinch_event,
+    .sync = virtio_input_handle_sync,
+};
+
+static void virtio_pinch_init(Object *obj)
+{
+    VirtIOInputHID *vhid = VIRTIO_INPUT_HID(obj);
+    VirtIOInput *vinput = VIRTIO_INPUT(obj);
+    const unsigned short keys[] = {
+        BTN_LEFT, BTN_TOUCH, BTN_TOOL_FINGER, BTN_TOOL_DOUBLETAP,
+    };
+    /* ABS_X and INPUT_PROP_POINTER are zero: the bitmap helper skips zero. */
+    const unsigned short axes[] = {
+        ABS_Y, ABS_MT_SLOT, ABS_MT_TRACKING_ID,
+        ABS_MT_POSITION_X, ABS_MT_POSITION_Y,
+    };
+    const unsigned short position_axes[] = {
+        ABS_X, ABS_Y, ABS_MT_POSITION_X, ABS_MT_POSITION_Y,
+    };
+    virtio_input_config config = {
+        .select = VIRTIO_INPUT_CFG_ID_NAME,
+        .size = sizeof("QEMU Virtio Pinch Touchpad"),
+        .u.string = "QEMU Virtio Pinch Touchpad",
+    };
+
+    virtio_input_config empty = {0};
+
+    vhid->handler = &virtio_pinch_handler;
+    virtio_input_init_config(vinput, &empty);
+    virtio_input_add_config(vinput, &config);
+    memset(&config, 0, sizeof(config));
+    config.select = VIRTIO_INPUT_CFG_ID_DEVIDS;
+    config.size = sizeof(struct virtio_input_devids);
+    config.u.ids.bustype = const_le16(BUS_VIRTUAL);
+    config.u.ids.vendor = const_le16(0x0627);
+    config.u.ids.product = const_le16(0x0004);
+    config.u.ids.version = const_le16(1);
+    virtio_input_add_config(vinput, &config);
+
+    virtio_input_extend_config(vinput, keys, ARRAY_SIZE(keys),
+                               VIRTIO_INPUT_CFG_EV_BITS, EV_KEY);
+    memset(&config, 0, sizeof(config));
+    config.select = VIRTIO_INPUT_CFG_EV_BITS;
+    config.subsel = EV_ABS;
+    config.size = 1;
+    config.u.bitmap[0] = 1 << ABS_X;
+    /* Include ABS_X explicitly as the generic bitmap helper skips zero. */
+    for (int i = 0; i < ARRAY_SIZE(axes); i++) {
+        config.u.bitmap[axes[i] / 8] |= 1 << (axes[i] % 8);
+        config.size = MAX(config.size, axes[i] / 8 + 1);
+    }
+    virtio_input_add_config(vinput, &config);
+    memset(&config, 0, sizeof(config));
+    config.select = VIRTIO_INPUT_CFG_PROP_BITS;
+    config.size = 1;
+    config.u.bitmap[0] = 1 << INPUT_PROP_POINTER;
+    virtio_input_add_config(vinput, &config);
+
+    memset(&config, 0, sizeof(config));
+    config.select = VIRTIO_INPUT_CFG_ABS_INFO;
+    config.size = sizeof(virtio_input_absinfo);
+    config.subsel = ABS_MT_SLOT;
+    config.u.abs.max = const_le32(1);
+    virtio_input_add_config(vinput, &config);
+    config.subsel = ABS_MT_TRACKING_ID;
+    config.u.abs.max = const_le32(65535);
+    virtio_input_add_config(vinput, &config);
+    /* A 3.3 m square sensor, with explicit resolution for libinput. */
+    config.u.abs.max = const_le32(INPUT_EVENT_ABS_MAX);
+    config.u.abs.res = const_le32(10);
+    for (int i = 0; i < ARRAY_SIZE(position_axes); i++) {
+        config.subsel = position_axes[i];
+        virtio_input_add_config(vinput, &config);
+    }
+}
+
+static const TypeInfo virtio_pinch_info = {
+    .name = TYPE_VIRTIO_PINCH,
+    .parent = TYPE_VIRTIO_INPUT_HID,
+    .instance_size = sizeof(VirtIOInputHID),
+    .instance_init = virtio_pinch_init,
+};
+
 /* ----------------------------------------------------------------- */
 
 static void virtio_register_types(void)
@@ -538,6 +664,7 @@ static void virtio_register_types(void)
     type_register_static(&virtio_mouse_info);
     type_register_static(&virtio_tablet_info);
     type_register_static(&virtio_multitouch_info);
+    type_register_static(&virtio_pinch_info);
 }
 
 type_init(virtio_register_types)
