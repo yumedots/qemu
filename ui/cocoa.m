@@ -40,6 +40,7 @@
 #include "ui/input.h"
 #include "ui/cocoa-pinch.h"
 #include "ui/cocoa-scroll.h"
+#include "ui/cocoa-touch-scroll.h"
 #include "ui/kbd-state.h"
 #include "system/system.h"
 #include "system/runstate.h"
@@ -462,6 +463,7 @@ static void handleAnyDeviceErrors(Error * err)
     bool mouseOn;
     CocoaPinch pinch;
     CocoaScroll scroll;
+    CocoaTouchScroll touchScroll;
     CocoaReveal notchReveal;
     bool notchCovered;
     bool notchLeaving;
@@ -489,6 +491,8 @@ static void handleAnyDeviceErrors(Error * err)
 - (void) endPinchLocked;
 - (void) resetPinchLocked:(bool)running;
 - (bool) handlePinchLocked:(NSEvent *)event;
+- (void) endTouchScrollLocked;
+- (bool) handleTouchScrollLocked:(NSEvent *)event;
 @end
 
 QemuCocoaView *cocoaView;
@@ -498,6 +502,7 @@ static VMChangeStateEntry *pinch_vm_change;
 static void cocoa_pinch_vm_change(void *opaque, bool running, RunState state)
 {
     [cocoaView resetPinchLocked:running];
+    [cocoaView endTouchScrollLocked];
 }
 
 
@@ -524,22 +529,39 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     return cgEvent;
 }
 
-/* Called under the same BQL as normal Cocoa input. */
-static void cocoa_pinch_send_frame(void *opaque, const CocoaPinchFrame *frame)
+/*
+ * Called under the same BQL as normal Cocoa input. Pinch and finger scrolling
+ * share the touchpad's two slots, so only one gesture owns them at a time.
+ */
+static void cocoa_touchpad_send(bool down, const int x[2], int y,
+                                const int id[2])
 {
     for (int slot = 0; slot < 2; slot++) {
         qemu_input_queue_mtt(dcl.con,
-                            frame->down ? INPUT_MULTI_TOUCH_TYPE_UPDATE :
-                                          INPUT_MULTI_TOUCH_TYPE_END,
-                            slot, frame->down ? slot : -1);
-        if (frame->down) {
-            qemu_input_queue_mtt_abs(dcl.con, INPUT_AXIS_X, frame->x[slot], 0,
-                                    COCOA_PINCH_AXIS_MAX, slot, slot);
-            qemu_input_queue_mtt_abs(dcl.con, INPUT_AXIS_Y, COCOA_PINCH_CENTER, 0,
-                                    COCOA_PINCH_AXIS_MAX, slot, slot);
+                            down ? INPUT_MULTI_TOUCH_TYPE_UPDATE :
+                                   INPUT_MULTI_TOUCH_TYPE_END,
+                            slot, down ? id[slot] : -1);
+        if (down) {
+            qemu_input_queue_mtt_abs(dcl.con, INPUT_AXIS_X, x[slot], 0,
+                                    COCOA_PINCH_AXIS_MAX, slot, id[slot]);
+            qemu_input_queue_mtt_abs(dcl.con, INPUT_AXIS_Y, y, 0,
+                                    COCOA_PINCH_AXIS_MAX, slot, id[slot]);
         }
     }
     qemu_input_event_sync();
+}
+
+static void cocoa_pinch_send_frame(void *opaque, const CocoaPinchFrame *frame)
+{
+    static const int ids[2] = { 0, 1 };
+
+    cocoa_touchpad_send(frame->down, frame->x, COCOA_PINCH_CENTER, ids);
+}
+
+static void cocoa_touch_scroll_send_frame(void *opaque,
+                                          const CocoaTouchScrollFrame *frame)
+{
+    cocoa_touchpad_send(frame->down, frame->x, frame->y, frame->id);
 }
 
 /*
@@ -1340,6 +1362,9 @@ static NSSize cocoa_guest_frame_size(NSSize size, CGFloat scale)
 
     if (phase & NSEventPhaseBegan) {
         action |= COCOA_PINCH_BEGIN;
+        if (eligible) {
+            [self endTouchScrollLocked];
+        }
     }
     if (phase & NSEventPhaseEnded) {
         action |= COCOA_PINCH_END;
@@ -1349,6 +1374,49 @@ static NSSize cocoa_guest_frame_size(NSSize size, CGFloat scale)
     }
     return cocoa_pinch_event(&pinch, action, eligible, [event magnification],
                             cocoa_pinch_send_frame, NULL);
+}
+
+/* The pinch bridge's VM state handler also releases these contacts on resume. */
+- (void) endTouchScrollLocked
+{
+    cocoa_touch_scroll_cancel(&touchScroll, cocoa_touch_scroll_send_frame, NULL);
+}
+
+- (bool) handleTouchScrollLocked:(NSEvent *)event
+{
+    NSEventPhase phase = [event phase];
+    NSEventPhase momentum = [event momentumPhase];
+    NSPoint point = [self convertPoint:[event locationInWindow] fromView:nil];
+    unsigned action = 0;
+    bool eligible = [event hasPreciseScrollingDeltas] &&
+                    [event window] == [self window] &&
+                    [[self window] isKeyWindow] &&
+                    NSPointInRect(point, [self bounds]) &&
+                    qemu_console_is_graphic(dcl.con) &&
+                    runstate_is_running();
+
+    if (phase & NSEventPhaseBegan) {
+        action |= COCOA_TOUCH_SCROLL_BEGIN;
+        if (eligible) {
+            [self endPinchLocked];
+        }
+    }
+    if (phase & NSEventPhaseEnded) {
+        action |= COCOA_TOUCH_SCROLL_END;
+    }
+    if (phase & NSEventPhaseCancelled) {
+        action |= COCOA_TOUCH_SCROLL_CANCEL;
+    }
+    if (momentum != NSEventPhaseNone) {
+        action |= COCOA_TOUCH_SCROLL_MOMENTUM;
+    }
+    if (momentum & (NSEventPhaseEnded | NSEventPhaseCancelled)) {
+        action |= COCOA_TOUCH_SCROLL_MOMENTUM_END;
+    }
+    return cocoa_touch_scroll_event(&touchScroll, action, eligible,
+                                    [event scrollingDeltaX],
+                                    [event scrollingDeltaY],
+                                    cocoa_touch_scroll_send_frame, NULL);
 }
 
 - (bool) handleEvent:(NSEvent *)event
@@ -1680,6 +1748,11 @@ static NSSize cocoa_guest_frame_size(NSSize size, CGFloat scale)
              * This is in-line with standard Mac OS X UI behaviour.
              */
 
+            /* Finger scrolling lets the guest recognize swipe navigation. */
+            if ([self handleTouchScrollLocked:event]) {
+                return true;
+            }
+
             if ([event hasPreciseScrollingDeltas]) {
                 CocoaScrollFrame frame;
 
@@ -1935,6 +2008,7 @@ static NSSize cocoa_guest_frame_size(NSSize size, CGFloat scale)
 {
     with_bql(^{
         [self endPinchLocked];
+        [self endTouchScrollLocked];
         injectedTextSource = 0;
         qkbd_state_lift_all_keys(kbd);
         leftCommandGuestDown = NO;
