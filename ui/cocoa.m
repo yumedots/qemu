@@ -2337,6 +2337,9 @@ static void cocoa_gl_render(void)
         glFlush();
         cocoa_gl_log_error("render end");
     }
+
+    /* Clear dirty flag after render completes to ensure clean handoff */
+    gl_dirty = false;
 }
 
 static void cocoa_gl_refresh(DisplayChangeListener *dcl)
@@ -2344,7 +2347,6 @@ static void cocoa_gl_refresh(DisplayChangeListener *dcl)
     cocoa_refresh(dcl);
 
     if (gl_dirty) {
-        gl_dirty = false;
 
         if (cocoa_gl_trace_enabled()) {
             cocoa_gl_log("refresh: triggering render dirty scanout=%d egl_surface=%d",
