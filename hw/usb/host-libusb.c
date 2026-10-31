@@ -169,6 +169,12 @@ static void usb_host_attach_kernel(USBHostDevice *s);
 
 /* ------------------------------------------------------------------------ */
 
+/*
+ * libusb's Darwin backend numbers the first USB controller 0, so "unset" can
+ * not share that value: hostbus=0 must select bus 0 rather than every bus.
+ */
+#define USB_HOST_ANY_BUS UINT32_MAX
+
 #define CONTROL_TIMEOUT  10000        /* 10 sec    */
 #define BULK_TIMEOUT         0        /* unlimited */
 #define INTR_TIMEOUT         0        /* unlimited */
@@ -1200,6 +1206,10 @@ static void usb_host_realize(USBDevice *udev, Error **errp)
         error_setg(errp, "hostaddr out of range");
         return;
     }
+    if (s->match.bus_num != USB_HOST_ANY_BUS && s->match.bus_num > 255) {
+        error_setg(errp, "hostbus out of range (exact bus 0 matching)");
+        return;
+    }
 
     loglevel = s->loglevel;
     udev->flags |= (1 << USB_DEV_FLAG_IS_HOST);
@@ -1223,7 +1233,7 @@ static void usb_host_realize(USBDevice *udev, Error **errp)
         }
     } else
 #endif
-    if (s->match.addr && s->match.bus_num &&
+    if (s->match.addr && s->match.bus_num != USB_HOST_ANY_BUS &&
         !s->match.vendor_id &&
         !s->match.product_id &&
         !s->match.port) {
@@ -1759,7 +1769,8 @@ static const VMStateDescription vmstate_usb_host = {
 };
 
 static const Property usb_host_dev_properties[] = {
-    DEFINE_PROP_UINT32("hostbus",  USBHostDevice, match.bus_num,    0),
+    DEFINE_PROP_UINT32("hostbus",  USBHostDevice, match.bus_num,
+                       USB_HOST_ANY_BUS),
     DEFINE_PROP_UINT32("hostaddr", USBHostDevice, match.addr,       0),
     DEFINE_PROP_STRING("hostport", USBHostDevice, match.port),
     DEFINE_PROP_UINT32("vendorid",  USBHostDevice, match.vendor_id,  0),
@@ -1854,7 +1865,7 @@ static void usb_host_auto_check(void *unused)
             }
             QTAILQ_FOREACH(s, &hostdevs, next) {
                 f = &s->match;
-                if (f->bus_num > 0 &&
+                if (f->bus_num != USB_HOST_ANY_BUS &&
                     f->bus_num != libusb_get_bus_number(devs[i])) {
                     continue;
                 }
